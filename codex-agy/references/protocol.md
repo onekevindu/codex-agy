@@ -38,7 +38,7 @@ CLI 参数已根据本机 `agy --help` 核对。升级后若参数发生变化�
 - `request.md` 保存包含执行与回传规则的实际输入。
 - `stdout.json` 保存 CLI 原始 JSON 信封，其中 `structured_output` 是 AGY 报告，`response` 是原始响应。
 - `stderr.log` 保存诊断，包括权限拒绝。
-- `run.json` 保存运行起止时间、工作区、进程退出码、超时或中断信息。
+- `run.json` 保存运行起止时间、工作区、命名项目、请求续接的会话 ID、进程退出码及超时或中断信息。
 
 每次使用新结果目录，旧记录禁止覆盖。脚本在同一工作区的并发调用间使用 POSIX 文件锁。锁在临时目录按工作区真实路径标识，只协调本脚本实例。外部编辑器、其他脚本或其他工作区共享的数据库等资源需要 Codex 按实际任务协调。
 
@@ -48,7 +48,9 @@ AGY 按 [result.schema.json](result.schema.json) 返回结果。`status` 使用 
 
 ## 续接与异常
 
-下一次输入带上 Codex 的解释或新决定、当前方案、已完成进度和剩余工作。已有代码保留在工作区，默认创建独立 AGY 调用。可按明确需要使用已核实的会话功能，Skill 的基本交接依赖显式输入与代码现场。
+首次委托和独立委托创建新会话。同一项委托需要澄清、续做或返工时，在下一次调用加上 `--resume-from /absolute/task/run-001`，并为本轮使用新的 `--output-dir`。脚本从上一轮的 `stdout.json` 读取 `conversation_id`，核对 `run.json` 中的目录和命名项目，再用 `agy --conversation` 续接。前几版记录没有 `project` 字段，只有能确认原调用未指定命名项目时才用它续接。[Antigravity CLI 续接文档](https://antigravity.google/docs/cli/headless#continue-a-conversation)
+
+下一次任务说明写明新的解释或决定及剩余工作。核对返回的 `conversation_id` 与请求续接的 ID 一致。会话无法恢复时，检查现有改动和日志，汇总当前方案与进度后开启新会话。用户可在同一个 Codex 对话中完成整个交接。
 
 若脚本进程被强制终止，`run.json` 可能停留在 `RUNNING`。先核对记录的进程与工作区活动，确认前次任务结束后再发出新委托。超时与正常取消会尝试终止本次 CLI 进程组，AGY 后台服务是否仍有工作需由 Codex 检查实际现场。
 

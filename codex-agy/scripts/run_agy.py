@@ -56,6 +56,7 @@ def main():
     parser.add_argument("--cwd", type=Path, required=True)
     parser.add_argument("--task-file", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--resume-from", type=Path, help="Previous run directory for the same delegation")
     parser.add_argument("--mode", choices=["plan", "accept-edits", "auto"], required=True)
     parser.add_argument("--project")
     parser.add_argument("--model")
@@ -76,6 +77,20 @@ def main():
     schema = Path(__file__).resolve().parents[1] / "references/result.schema.json"
     command = [executable, "--print", prompt, "--output-format", "json",
                "--json-schema", str(schema), "--mode", args.mode]
+    conversation_id = None
+    if args.resume_from:
+        try:
+            previous_run = json.loads((args.resume_from / "run.json").read_text(encoding="utf-8"))
+            previous_result = json.loads((args.resume_from / "stdout.json").read_text(encoding="utf-8"))
+            conversation_id = previous_result["conversation_id"]
+            previous_workspace = (previous_run["cwd"], previous_run.get("project"))
+        except (OSError, ValueError, TypeError, KeyError, AttributeError) as error:
+            parser.error(f"cannot read previous run: {error}")
+        if previous_workspace != (str(cwd), args.project):
+            parser.error("previous run must use the same working directory and project")
+        if not isinstance(conversation_id, str) or not conversation_id.strip():
+            parser.error("previous run has no usable conversation_id")
+        command.extend(["--conversation", conversation_id])
     for flag in ("project", "model", "effort"):
         value = getattr(args, flag)
         if value:
@@ -97,7 +112,8 @@ def main():
         output = args.output_dir.resolve()
         output.mkdir(parents=True, exist_ok=False)
         (output / "request.md").write_text(prompt, encoding="utf-8")
-        metadata = {"state": "RUNNING", "cwd": str(cwd), "requested_mode": args.mode,
+        metadata = {"state": "RUNNING", "cwd": str(cwd), "project": args.project,
+                    "requested_conversation_id": conversation_id, "requested_mode": args.mode,
                     "started_at": timestamp(), "runner_pid": os.getpid(),
                     "exit_code": None, "error": None}
         save_metadata(output, metadata)
