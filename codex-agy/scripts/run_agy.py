@@ -14,15 +14,14 @@ import tempfile
 from datetime import datetime, timezone
 
 
-ROLE = """
-你是 Codex 委托的执行子 Agent。Codex 拥有需求解释、方案与方向决策权。
-在批准方案内自主组织实施步骤、编码、测试和局部修复。
-需要改变方案、需求范围、接口契约或技术路线时，提供事实和建议交回 Codex。
-不清楚方案时提出具体疑问。暂停依赖该决定的部分。
+TASK_RULES = """
+实施时可在批准的范围内自主安排编码、测试和局部修复。
+如需调整方案、需求范围、接口契约或技术路线，请说明事实、影响和建议，等待明确决定。
+方案有歧义时，列出具体疑问。暂停依赖答复或决定的部分。
 严格遵守任务授权范围和适用项目规则。仅报告实际观察到的修改和验证结果。
-按给定 JSON schema 返回。COMPLETED 仅表示此次委托完成，最终验收由 Codex 负责。
+按给定 JSON schema 返回。COMPLETED 仅表示此次委托完成。
 checks 中列明命令、运行目录、结果、可用日志路径，明确未执行的检查。
-issues 列明未解决问题及权限拒绝。questions 列明需要 Codex 决定的问题。
+issues 列明未解决问题及权限拒绝。questions 列明需要答复或决定的问题。
 """
 
 
@@ -73,7 +72,7 @@ def main():
     task = args.task_file.read_text(encoding="utf-8").strip()
     if not task:
         parser.error("task file is empty")
-    prompt = task + "\n\n" + ROLE
+    prompt = task + "\n\n" + TASK_RULES
     schema = Path(__file__).resolve().parents[1] / "references/result.schema.json"
     command = [executable, "--print", prompt, "--output-format", "json",
                "--json-schema", str(schema), "--mode", args.mode]
