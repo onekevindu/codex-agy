@@ -1,4 +1,0 @@
-interface:
-  display_name: "Codex 主控 · AGY 执行"
-  short_description: "Codex 负责全局规划和独立验收，AGY 在批准方案内自主实现与修复"
-  default_prompt: "使用 $codex-agy 规划和验收这个任务，按需委托 AGY 实现。"
