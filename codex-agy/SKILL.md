@@ -8,12 +8,20 @@ description: 通过 Antigravity CLI（agy）使用 AGY 作为 Codex 的实现 Su
 ## 核心原则
 
 **不要把 AGY 当傻子，Codex 不要过度限制，也不要过度指导。**
-Codex 的职责是讲清楚**要实现什么目标、不能破坏什么边界、怎么算验收通过**，然后把执行过程的自主权真正交给 AGY：
+本机 `~/.gemini/antigravity-cli/settings.json` 已全局配置完整权限（`"toolPermission": "always-proceed"`, `"allowNonWorkspaceAccess": true`, `"enableTerminalSandbox": false`）。Codex 的职责是讲清楚**要实现什么目标、不能破坏什么边界、怎么算验收通过**，把执行自主权交给 AGY，并管住自己的唤醒消耗：
 
-- **委托前**：Codex 明确目标、必要设计、不可变边界和验收条件。若工作区有未提交改动，先做好基线备份（避免回滚时误用 `git checkout HEAD` 清空未提交成果）。不要替 AGY 全量扫库，不要写多份冗长的委托文档，也不要在提示词里教 AGY 怎么调工具、一次读几行或用哪个编辑函数。
-- **执行中**：AGY 自主阅读、编码、运行测试和局部纠错；Codex 在工具侧持续等待结果（拉满 `yield_time_ms`），不频繁唤醒模型空轮询，不读取 AGY 内部状态库，不按读取次数和耗时催写。
-- **交付后**：Codex 集中审查 `git diff`、执行独立验证，把实际问题一次性交回 AGY。
-- **出现阻塞时**：针对具体阻塞点定向处理，避免重新调查整个任务。
+- **委托前**：
+  - Codex 明确业务目标、必要设计、不可变边界和验收条件，不替 AGY 全量预读源码，也不在提示词里教 AGY 怎么调工具。
+  - **基线快照保护**：若工作区存在未提交改动，委托前先做好快照备份；后续若需回滚，**只能依据委托前快照恢复**，严禁直接执行 `git checkout/restore/reset/clean` 恢复到 `git HEAD` 而误删前序未提交成果。
+- **执行中（严控 Codex 唤醒）**：
+  - 单层直派单个 AGY 会话，由 AGY 自主完成阅读、编码、运行构建/测试与编译报错自修复。
+  - **长等待与纯续等铁律**：启动 `agy` 及后续 `write_stdin` 均拉满工具侧等待上限（`yield_time_ms`）。若单次等待达上限时进程仍未退出，**下一轮只允许纯粹继续等待原进程**，严禁在等待中途顺手执行 `git diff`/`git status`、严禁读取 `~/.gemini/` 内部日志、严禁按读取次数或耗时发消息催写。
+- **交付后（完成判定与集中终验）**：
+  - 从 `--output-format json` 返回结果中提取并保存 `conversation_id`，同时检查进程退出码、`status`、`stderr` 及 `denied_actions`（不能仅凭退出码 `0` 认定完成）。
+  - AGY 自测通过返回后，Codex 集中审查 `git diff` 并做独立验证；若仍有遗漏问题，一次性汇总交回 AGY。
+- **职责红线与阻塞处理**：
+  - **生产代码、测试代码与实现配置始终由 AGY 修改**：若验证失败或遇到环境阻塞，Codex 负责排查外部阻塞或汇总问题后继续委托 AGY，**Codex 绝不亲自下场改业务代码**。
+  - **AGY 不擅改方向**：AGY 遇到需变更技术方案、突破不可变边界或扩大修改范围的问题时，停止试错并交回 Codex 决策。
 
 ---
 
@@ -21,50 +29,49 @@ Codex 的职责是讲清楚**要实现什么目标、不能破坏什么边界、
 
 ### 1. 可行性评估（仅复杂方案按需触发）
 
-常规任务或边界清晰的需求，Codex 与用户确认目标后直接进入实施。仅当涉及复杂架构、跨服务契约或事务/状态机改造时，请 AGY 做一次单轮只读评估：
+常规任务或边界清晰的需求，确认目标后直接进入实施。仅当涉及复杂架构、跨服务契约或状态机改造时，请 AGY 做单轮只读评估。
 
-- 注意：`agy` 的 `--mode plan` 在底层会自动注入 `/plan` 宏（触发生成计划文档的长流程），因此只读评估统一使用 `--mode accept-edits --disable-slash-commands` 搭配 `--settings` 禁止写入和命令执行：
+- `agy` 的 `--mode plan` 在底层会自动注入 `/plan` 宏，因此只读评估统一使用 `--mode accept-edits --disable-slash-commands`，并仅通过 `--settings` 禁止文件写入与破坏性命令（保留完整的代码读取、内置 `ripgrep` 搜索与只读 Git 检索能力）：
 
 ```bash
 agy --project '<项目ID>' --model '<旗舰 Medium 模型 ID>' --mode accept-edits --disable-slash-commands \
-  --settings '{"allowNonWorkspaceAccess":false,"enableTerminalSandbox":true,"toolPermission":"request-review","permissions":{"allow":["read_file(/绝对路径/工作区根目录)"],"deny":["write_file(*)","command(*)","mcp(*)","read_url(*)"]}}' \
+  --settings '{"permissions":{"deny":["write_file(*)","command(rm*)","command(git reset*)","command(git checkout*)","command(git restore*)","command(git clean*)","command(git commit*)","command(git push*)"]}}' \
   --output-format json \
   -p '评估以下方案的可行性，对照现有代码指出潜在冲突、遗漏边界和修正建议。'
 ```
 
 Codex 核实评估意见后向用户汇报方案，确认后进入实施，不进行多轮文字辩论。
 
-### 2. 派发实施（单层直派，赋予完整自治权）
+### 2. 派发实施（复用全局完整权限，极简调用）
 
-收到用户确认后，直接派发单个 AGY 会话（无需额外套一层“AGY 负责人”进程传话）。给予整个工作区的读写权限与沙箱内命令执行权限（`proceed-in-sandbox`），不要做碎片化的单文件白名单限制，也不要硬性指定构建日志落盘路径：
+收到用户确认后，直接派发单个 AGY 会话（无需传 `--sandbox` 或冗长的 `--settings` 白名单，直接继承本机 `settings.json` 的完整权限）：
 
 ```bash
-agy --project '<项目ID>' --model '<中档 High 模型 ID>' --mode accept-edits --disable-slash-commands --sandbox \
-  --settings '{"allowNonWorkspaceAccess":false,"enableTerminalSandbox":true,"toolPermission":"proceed-in-sandbox","permissions":{"allow":["read_file(/绝对路径/工作区根目录)","write_file(/绝对路径/工作区根目录)","command(env)","command(mvn)","command(git status)","command(git diff)"],"deny":["unsandboxed(*)","command(git checkout)","command(git reset)","command(git clean)","command(git commit)","command(git push)","mcp(*)","read_url(*)"]}}' \
+agy --project '<项目ID>' --model '<中档 High 模型 ID>' --mode accept-edits --disable-slash-commands \
   --output-format json \
-  -p '目标：<讲清楚要实现的业务目标与关键技术决策>
-不可变边界：<必须保留的既有行为、接口与协议>
+  -p '目标：<要实现的业务目标与关键技术决策>
+不可变边界：<必须保留的既有行为、接口与协议；禁止执行 git checkout/restore/reset/clean 丢弃未提交改动>
 验收条件：<构建或测试通过标准>
 请自主完成代码修改、测试编写与本地构建自检，修复发现的问题后返回改动摘要。'
 ```
 
-（若目标项目使用 Gradle、pytest、npm 等其他构建工具，将 `command(mvn)` 替换为对应工具命令即可。）
-
 ### 3. 续接与集中返工
 
-交付后 Codex 集中审查 `git diff` 并做验证。若存在遗漏问题，一次性汇总交给原会话修复：
+交付后若验证发现遗漏问题，用保存的 `conversation_id` 一次性汇总交回原会话修复：
 
 ```bash
-agy --conversation '<conversation_id>' --model '<中档 High 模型 ID>' --mode accept-edits --disable-slash-commands --sandbox \
-  --settings '<同上会话权限 JSON>' --output-format json \
+agy --conversation '<conversation_id>' --model '<中档 High 模型 ID>' --mode accept-edits --disable-slash-commands \
+  --output-format json \
   -p '验证发现以下问题，请一并修复并重新自检通过：<问题列表>'
 ```
 
-若会话历经多轮后触发上下文自动压缩（~256K tokens）且出现细节遗忘，基于当前 Git 状态开启新会话处理剩余问题。
+- **上下文切换**：不监控内部 token 计数；仅当多轮续接后出现明显上下文遗忘或重复报错打转时，开启新会话并明确交接当前已完成改动与剩余问题。
 
 ---
 
 ## 项目与模型选型
 
-1. **项目归属**：在目标仓库根目录启动 `agy`。首次调用时从 `~/.gemini/config/projects/*.json` 选取绑定当前仓库的同名项目 `id`，后续复用 `--project '<项目ID>'`。
+1. **项目归属**：始终在目标仓库根目录启动 `agy`。首次调用时查阅 `~/.gemini/config/projects/*.json`：
+   - 若存在 `folderUri` 匹配当前仓库根目录的项目，复用 `--project '<项目ID>'`；
+   - 若不存在匹配项目或目录不一致，直接省略 `--project` 参数（由 `agy` 在当前工作区根目录自动映射）。
 2. **模型与额度**：仅在当前对话首次使用 AGY 或遇到配额报错时查一次 `agy models` 与 `agy -p '/usage'`。复杂方案评估优先选有额度的旗舰模型 Medium（如 `gemini-4-argon-medium`）；实施与修复优先选中档模型 High（如 `gemini-3.8-flash-high`）或旗舰 Medium。
