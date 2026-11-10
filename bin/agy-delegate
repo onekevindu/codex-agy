@@ -1,0 +1,321 @@
+#!/usr/bin/env python3
+"""
+agy-delegate: Deterministic wrapper for Codex -> AGY delegation.
+- Automatically resolves --project <id> from ~/.gemini/config/projects/*.json matching current workspace
+- Automatically snapshots dirty/untracked non-ignored workspace files before write runs (preventing git HEAD rollback loss)
+- Provides `agy-delegate restore <snapshot_dir>` for 1-click safe rollback to pre-delegation state
+- Enforces --mode accept-edits --disable-slash-commands --output-format json
+- Validates JSON output (status, conversation_id, denied_actions, error) and exits non-zero on soft-denials
+"""
+import argparse
+import datetime
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from urllib.parse import unquote, urlparse
+
+READONLY_SETTINGS = json.dumps({
+    "permissions": {
+        "deny": [
+            "write_file(*)",
+            "command(rm*)",
+            "command(git reset*)",
+            "command(git checkout*)",
+            "command(git restore*)",
+            "command(git clean*)",
+            "command(git commit*)",
+            "command(git push*)",
+        ]
+    }
+}, separators=(",", ":"))
+
+
+def get_workspace_root() -> Path:
+    try:
+        out = subprocess.check_output(
+            ["git", "rev-parse", "--show-toplevel"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+        if out:
+            return Path(out).resolve()
+    except Exception:
+        pass
+    return Path.cwd().resolve()
+
+
+def resolve_project_id(ws_root: Path) -> str:
+    ws_str = str(ws_root)
+    projects_dir = Path.home() / ".gemini" / "config" / "projects"
+    if not projects_dir.is_dir():
+        return ""
+    candidates = []
+    for p in sorted(projects_dir.glob("*.json")):
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            pid = data.get("id", "")
+            name = data.get("name", "")
+            resources = data.get("projectResources", {}).get("resources", [])
+            for idx, r in enumerate(resources):
+                has_git = "gitFolder" in r
+                uri = (
+                    r.get("folderUri")
+                    or r.get("gitFolder", {}).get("folderUri")
+                    or ""
+                )
+                if uri.startswith("file://"):
+                    folder = str(Path(unquote(urlparse(uri).path)).resolve())
+                    if folder == ws_str:
+                        score = (
+                            1 if name == ws_root.name else 0,
+                            1 if idx == 0 else 0,
+                            1 if has_git else 0,
+                            1 if "permissionGrants" in data else 0,
+                        )
+                        candidates.append((score, pid))
+        except Exception:
+            continue
+    if not candidates:
+        return ""
+    candidates.sort(reverse=True)
+    return candidates[0][1]
+
+
+def list_dirty_state(ws_root: Path):
+    """Return (existing_dirty_rel_paths, deleted_rel_paths) for current workspace."""
+    try:
+        raw = subprocess.check_output(
+            ["git", "status", "--porcelain", "-z", "--untracked-files=all"],
+            cwd=str(ws_root),
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        return [], []
+    if not raw:
+        return [], []
+
+    entries = raw.decode("utf-8", errors="replace").split("\0")
+    existing = []
+    deleted = []
+    i = 0
+    while i < len(entries):
+        entry = entries[i]
+        if not entry or len(entry) < 4:
+            i += 1
+            continue
+        status = entry[:2]
+        rel_path = entry[3:]
+        if "R" in status or "C" in status:
+            i += 1
+        full_path = ws_root / rel_path
+        if full_path.exists() and full_path.is_file():
+            existing.append(rel_path)
+        elif not full_path.exists():
+            deleted.append(rel_path)
+        i += 1
+    return existing, deleted
+
+
+def snapshot_dirty_workspace(ws_root: Path) -> str:
+    """Snapshot current dirty state (modified + untracked non-ignored files) before AGY runs."""
+    files_to_save, deleted_files = list_dirty_state(ws_root)
+    ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    snap_dir = Path("/tmp/agy-snapshots") / f"{ws_root.name}-{ts}"
+    files_dir = snap_dir / "files"
+    files_dir.mkdir(parents=True, exist_ok=True)
+
+    for rel in files_to_save:
+        src = ws_root / rel
+        dst = files_dir / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+
+    manifest = {
+        "workspace": str(ws_root),
+        "timestamp": ts,
+        "saved_files": files_to_save,
+        "pre_deleted_files": deleted_files,
+    }
+    (snap_dir / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return str(snap_dir)
+
+
+def restore_snapshot(snap_dir_str: str) -> int:
+    snap_dir = Path(snap_dir_str).resolve()
+    manifest_path = snap_dir / "manifest.json"
+    if not manifest_path.is_file():
+        print(json.dumps({"ok": False, "error": f"Manifest not found: {manifest_path}"}))
+        return 1
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    ws_root = Path(manifest["workspace"]).resolve()
+    saved_set = set(manifest.get("saved_files", []))
+    pre_deleted_set = set(manifest.get("pre_deleted_files", []))
+
+    current_existing, current_deleted = list_dirty_state(ws_root)
+    all_touched = (set(current_existing) | set(current_deleted)) - saved_set - pre_deleted_set
+
+    # 1. Revert any newly modified/deleted tracked files or remove newly created untracked files
+    for rel in sorted(all_touched):
+        full = ws_root / rel
+        in_head = subprocess.run(
+            ["git", "cat-file", "-e", f"HEAD:{rel}"],
+            cwd=str(ws_root),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ).returncode == 0
+        if in_head:
+            subprocess.run(
+                ["git", "checkout", "HEAD", "--", rel],
+                cwd=str(ws_root),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        elif full.exists():
+            full.unlink()
+
+    # 2. Restore saved dirty/untracked files from snapshot
+    files_dir = snap_dir / "files"
+    for rel in sorted(saved_set):
+        src = files_dir / rel
+        dst = ws_root / rel
+        if src.is_file():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+
+    # 3. Ensure pre-deleted files remain deleted
+    for rel in sorted(pre_deleted_set):
+        dst = ws_root / rel
+        if dst.exists():
+            dst.unlink()
+
+    print(json.dumps({
+        "ok": True,
+        "restored_snapshot": str(snap_dir),
+        "workspace": str(ws_root),
+        "git_status": git_short_status(ws_root),
+    }, ensure_ascii=False, indent=2))
+    return 0
+
+
+def git_short_status(ws_root: Path) -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "status", "--short"],
+            cwd=str(ws_root),
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+    except Exception:
+        return ""
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Deterministic Codex -> AGY delegation wrapper"
+    )
+    sub = parser.add_subparsers(dest="subcommand", required=True)
+
+    p_run = sub.add_parser("run", help="Start a new implementation session")
+    p_run.add_argument("--model", default="gemini-3.8-flash-high")
+    p_run.add_argument("--project", default="")
+    p_run.add_argument("--timeout", default="1800s")
+    p_run.add_argument("prompt", help="Task prompt for AGY")
+
+    p_res = sub.add_parser("resume", help="Resume an existing conversation")
+    p_res.add_argument("conversation_id", help="Conversation ID to resume")
+    p_res.add_argument("--model", default="gemini-3.8-flash-high")
+    p_res.add_argument("--timeout", default="1800s")
+    p_res.add_argument("prompt", help="Follow-up prompt for AGY")
+
+    p_rev = sub.add_parser("review", help="Run a single-round read-only review")
+    p_rev.add_argument("--model", default="gemini-4-argon-medium")
+    p_rev.add_argument("--project", default="")
+    p_rev.add_argument("--timeout", default="600s")
+    p_rev.add_argument("prompt", help="Read-only evaluation prompt for AGY")
+
+    p_rst = sub.add_parser("restore", help="Restore workspace to a pre-delegation snapshot")
+    p_rst.add_argument("snapshot_dir", help="Snapshot directory from pre_snapshot_dir")
+
+    args = parser.parse_args()
+    if args.subcommand == "restore":
+        return restore_snapshot(args.snapshot_dir)
+
+    ws_root = get_workspace_root()
+    project_id = getattr(args, "project", "") or resolve_project_id(ws_root)
+    snapshot_dir = ""
+
+    cmd = ["agy"]
+    if args.subcommand in ("run", "review") and project_id:
+        cmd.extend(["--project", project_id])
+    if args.subcommand == "resume":
+        cmd.extend(["--conversation", args.conversation_id])
+
+    cmd.extend([
+        "--model", args.model,
+        "--mode", "accept-edits",
+        "--disable-slash-commands",
+        "--print-timeout", args.timeout,
+        "--output-format", "json",
+    ])
+
+    if args.subcommand == "review":
+        cmd.extend(["--settings", READONLY_SETTINGS])
+    else:
+        snapshot_dir = snapshot_dirty_workspace(ws_root)
+
+    cmd.extend(["-p", args.prompt])
+
+    proc = subprocess.run(
+        cmd,
+        cwd=str(ws_root),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    stdout_str = (proc.stdout or "").strip()
+    stderr_str = (proc.stderr or "").strip()
+    parsed = {}
+    if stdout_str:
+        try:
+            parsed = json.loads(stdout_str)
+        except Exception:
+            idx = stdout_str.find("{")
+            if idx != -1:
+                try:
+                    parsed = json.loads(stdout_str[idx:])
+                except Exception:
+                    pass
+
+    status = parsed.get("status", "UNKNOWN" if proc.returncode == 0 else "ERROR")
+    conv_id = parsed.get("conversation_id", getattr(args, "conversation_id", ""))
+    denied = parsed.get("denied_actions") or []
+    err_msg = parsed.get("error") or ""
+
+    ok = proc.returncode == 0 and status == "SUCCESS" and not denied and not err_msg
+    result = {
+        "ok": ok,
+        "exit_code": proc.returncode,
+        "status": status,
+        "conversation_id": conv_id,
+        "project_id": project_id,
+        "workspace": str(ws_root),
+        "pre_snapshot_dir": snapshot_dir,
+        "denied_actions": denied,
+        "error": err_msg,
+        "stderr": stderr_str,
+        "git_status": git_short_status(ws_root),
+        "response": parsed.get("response", stdout_str),
+    }
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0 if ok else 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

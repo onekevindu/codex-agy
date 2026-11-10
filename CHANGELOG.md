@@ -1,35 +1,37 @@
 # Changelog
 
+## [2.3.0] - 2026-11-10 — 用代码机制替代口头约定：V8 内置 `while` 零唤醒循环 + `agy-delegate` 确定性包装器
+
+深入排查 Codex 底层 `rollout-2026-11-09T09-53-04.jsonl` 的 `additional_tools` 声明与 205 次 `exec` 调用源码后，定位到 Codex 频繁唤醒的物理根因，并用确定性代码机制彻底替代软性文字叮嘱：
+
+1. **V8 `exec` 内置 `while` 循环，彻底消灭 30 秒空轮询唤醒**：
+   - **底层根因**：Codex 的 `tools.exec_command` 单次等待物理上限仅为 `30000 ms`（30 秒），外层 `exec`（JavaScript V8 沙箱）默认 `yield_time_ms` 也是 `30000 ms`，而 `tools.write_stdin` 空轮询最高支持 `300000 ms`（5 分钟）。此前 Codex 每次只写单行 `write_stdin(30000)` 甚至设置 `// @exec: {"yield_time_ms": 1000}`，导致每 30 秒必退回大模型重跑一次完整上下文。
+   - **机制根治**：在 `SKILL.md` 中固化带 `// @exec: {"yield_time_ms": 300000}` 头部的 V8 `while (res.session_id !== undefined)` 标准循环模板。`exec_command` 满 30 秒返回 `session_id` 后直接在 V8 内部无缝切入 `write_stdin(300000)`，**5 分钟内的任务实现 0 次模型中途唤醒**。
+2. **新增 `/Users/du/.local/bin/agy-delegate`（[bin/agy-delegate](bin/agy-delegate)）确定性包装脚本**：
+   - **自动匹配项目 ID**：自动解析 `~/.gemini/config/projects/*.json` 匹配当前工作区根目录，免去 Codex 每次手写脚本查配置。
+   - **自动脏工作区快照与一键无损回滚（`agy-delegate restore`）**：在 `run` / `resume` 执行前自动备份工作区已修改和未跟踪源码至 `/tmp/agy-snapshots/`，并提供 `agy-delegate restore <snapshot_dir>` 一键精确还原，物理杜绝误用 `git checkout/restore HEAD` 抹掉未提交成果。
+   - **自动校验 JSON 与 `denied_actions`**：自动解析 `agy` 返回的 JSON，若 `status != "SUCCESS"` 或 `denied_actions` 非空，直接以退出码 `2` 报错，消除退出码 `0` 软拒绝误判。
+
+---
+
 ## [2.2.1] - 2026-11-10 — 全局完整权限固化与 Codex 唤醒防线收口
 
 1. **全局权限下沉至 `settings.json`，彻底移除命令行 `--sandbox --settings` 枷锁**：
    - 在 `~/.gemini/antigravity-cli/settings.json` 中固化全局完整权限（`"toolPermission": "always-proceed"`, `"allowNonWorkspaceAccess": true`, `"enableTerminalSandbox": false`），并清理 `~/.gemini/config/projects/*.json` 中残留的项目级询问策略。
-   - 实施与续接命令不再拼接冗长的 `--sandbox --settings '{...}'`，从根源上消除因参数配置不当导致的非工作区访问拒绝（如 `/Users/du/nacos`、`~/.m2`、外部 JDK）与沙箱重定向冲突。
 2. **收紧对 Codex 自身行为的硬性约束**：
-   - **纯续等铁律**：单次等待达宿主工具上限仍未退出时，下一轮只允许纯粹继续等待原进程，严禁顺手跑 `git diff`/`status`、查内部日志或发催写消息。
-   - **完成判定协议**：明确要求保存 `conversation_id`，并同时核对退出码、`status`、`stderr` 与 `denied_actions`（防止 headless 软拒绝返回退出码 `0` 时误判成功）。
-   - **职责红线**：明确生产/测试代码始终由 AGY 修改，失败或阻塞时 Codex 排障后继续委托，绝不亲自下场改代码；AGY 遇到需改技术方案或扩围的问题交回 Codex 决策。
-   - **细节补齐**：只读评估保留读取与只读 Git 检索能力（仅禁写入与破坏性命令 `git restore/checkout/reset/clean`）；补全无匹配项目时省略 `--project` 的回退规则；去掉 `~256K` 数字监控，改按实际出现上下文遗忘时开启新会话交接。
+   - 补齐纯续等铁律、JSON `denied_actions` 完成判定、职责红线（生产/测试代码始终由 AGY 修改，Codex 绝不亲自下场写代码）及细节修正。
 
 ---
 
 ## [2.2.0] - 2026-11-10 — 彻底去微观管理化（不把 AGY 当傻子：只定目标与边界，不做过度限制与过度指导）
 
-在完成底层证据链复盘后，进一步砍掉 Skill 中残留的“教 AGY 怎么调工具、一次读几行、必须用哪个函数、日志写到哪里”等微观管理规则，回归最纯粹的自治协作：
-
-1. **只讲目标与边界，不教 AGY 怎么干活**：
-   - 移除提示词中对 AGY 工具用法的琐碎说教（如“≤800行一次读完”、“必须传绝对路径”、“核实真实签名”、“日志写到 `target/`”等）。只要给足权限且中途不瞎催，AGY 自己会读取所需上下文并通过编译器和单测闭环纠错。
-2. **四阶段极简契约**：
-   - **委托前**：Codex 明确目标、必要设计、不可变边界和验收条件（若有未提交改动先做好基线保护）。
-   - **执行中**：AGY 自主阅读、编码、测试和局部纠错；Codex 在工具侧拉满 `yield_time_ms` 静默等待结果，不按读取次数和耗时催写，不轮询内部记录。
-   - **交付后**：Codex 集中审查 `git diff` 与构建结果，把实际问题一次性交回 AGY。
-   - **出现阻塞时**：针对具体阻塞处理，避免重新调查整个任务。
+- 移除提示词中对 AGY 工具用法的琐碎说教（如“≤800行一次读完”、“必须传绝对路径”、“核实真实签名”、“日志写到 `target/`”等），回归“委托前定目标与边界 $\rightarrow$ 执行中 AGY 自治闭环 $\rightarrow$ 交付后一次集中终验 $\rightarrow$ 阻塞时定向排障”的四阶段极简契约。
 
 ---
 
 ## [2.1.0] - 2026-11-10 — 额度重平衡与执行自治架构（解决“Codex 额度耗尽 100%、Gemini 仅耗 6%”）
 
-- **根因总结**：此前把编码交给了 AGY，却没有把执行过程的自主权交出去。11 月 9 日全天 Codex 共触发 323 次模型调用、累计 8,441 万输入 tokens；其中仅最后一轮“四表实施”就包含 49 次 `yield_time_ms: 30000` 空等待返回，直接触发的下一次模型唤醒累计携带 1,832 万输入 tokens。再加上 Codex 委托前自己做了 76 次代码搜索读取、通过负责人双进程传话催写、用单文件白名单和 `/private/tmp` 日志重定向制造沙箱冲突，导致省下的编码消耗被监工和返工消耗成倍抵消。
+- **根因总结**：11 月 9 日全天 Codex 共触发 323 次模型调用、累计 8,441 万输入 tokens；其中仅最后一轮“四表实施”就包含 49 次 `yield_time_ms: 30000` 空等待返回，直接触发的下一次模型唤醒累计携带 1,832 万输入 tokens。再加上 Codex 委托前自己做了 76 次代码搜索读取、通过负责人双进程传话催写、用单文件白名单和 `/private/tmp` 日志重定向制造沙箱冲突，导致省下的编码消耗被监工和返工消耗成倍抵消。
 - **核心改进**：砍掉外部“AGY 负责人”传话层，放开工作区完整权限与构建自检权限，让 AGY 端到端修到构建全绿再返回。
 
 ---
