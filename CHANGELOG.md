@@ -21,8 +21,8 @@
 1. **委托前（Codex 极简立项，重度调研下放 AGY）**
    - Codex 只用 1–3 次 `rg` 定位入口并保护未提交基线，明确**目标、必要设计、不可变边界与验收条件**；绝不自行全量扫库把几万行源码塞进主控上下文。
 2. **执行中（AGY 沙箱内“读取 + 编码 + 构建自修复”全闭环自治）**
-   - 赋予 AGY `--sandbox` + `toolPermission: "proceed-in-sandbox"` 权限，允许其在工作区内自由读写源码并直接运行本地 Maven/测试命令。
-   - **破除沙箱构建伪阻塞**：明确要求 AGY 直接读命令标准输出或将构建日志写入工作区内 `target/agy-build.log`，**严禁重定向到 `/private/tmp`，严禁设置 `BypassSandbox=true`**。AGY 必须在单回合内自主把代码和单测修到全绿再返回。
+   - 赋予 AGY `--sandbox` + `toolPermission: "proceed-in-sandbox"` 权限，允许其在工作区内自由读写源码并自主运行本地构建/测试命令。
+   - **不预设日志落盘枷锁**：Codex 不再强制要求 AGY 将构建日志重定向到 `/private/tmp` 等外部路径，交由 AGY 原生命令工具自行处理，在单回合内自主把代码和单测修到全绿再返回。
    - **Codex 静默长等待与“三不准”**：工具侧拉满 `yield_time_ms` 持续等待，不轮询、不扒内部状态库、不凭读取次数或耗时催写、不禁止缺失原文（如 `PublicHealthIngestService` 451–580 行）的必要定向补读。
 3. **交付后（Codex 一次性集中终验）**
    - AGY 交付全绿结果后，Codex 集中审查 `git diff` 并做一次宿主构建终验；若有遗漏问题一次性打包交回。

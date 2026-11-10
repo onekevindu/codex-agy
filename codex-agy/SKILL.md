@@ -38,20 +38,17 @@ description: 通过 Antigravity CLI（agy）使用 AGY 作为 Codex 的实现 Su
 收到用户明确确认后，**由 Codex 直接派发单个 AGY 执行会话**（严禁在外部同时起“AGY 负责人 + AGY 执行者”两个 CLI 进程传话）。
 
 #### （1）赋予 AGY 沙箱内“编码 + 本地构建自修复”完整自治权
-- 不要让 AGY 写完代码盲交回来等 Codex 编译报错！那会让每次拼写/签名小错都消耗一轮 Codex 40 万 Token 的上下文往返。
-- 使用 `--sandbox` 搭配会话设置 `"enableTerminalSandbox": true, "toolPermission": "proceed-in-sandbox"`，允许 AGY 在沙箱内直接运行本地 JDK/Maven 测试，**自己看报错、自己修到编译与单测全绿后再退出返回**。
-- **避开 `/private/tmp` 写冲突与 `unsandboxed` 拒绝的铁律**：
-  - macOS Seatbelt 沙箱下，向 `/private/tmp` 中已存在的日志文件做 `>` 重定向会报 `operation not permitted`，进而诱发 AGY 尝试 `BypassSandbox=true` 被拒（`unsandboxed` 错误）。
-  - 因此必须在提示词中规定：**AGY 在沙箱内运行 Maven/测试时，直接读取命令标准输出，或将日志重定向到工作区内的 `target/` 目录（如 `target/agy-build.log`），严禁重定向到 `/private/tmp`，严禁设置 `BypassSandbox=true`**。
+- 不要让 AGY 写完代码盲交回来等 Codex 编译报错。使用 `--sandbox` 搭配会话设置 `"enableTerminalSandbox": true, "toolPermission": "proceed-in-sandbox"`，允许 AGY 在沙箱内自主运行本地构建与单测，**自己看报错、自己修到编译与单测全绿后再退出返回**。
+- **不要规定构建日志落盘路径**：Codex 不要要求 AGY 把构建日志重定向到 `/private/tmp` 等指定文件，交给 AGY 原生 `run_command` 自行处理即可。
 
 ```bash
 agy --project '<项目ID>' --model '<中档 High 模型 ID>' --mode accept-edits --disable-slash-commands --sandbox \
   --settings '{"allowNonWorkspaceAccess":false,"enableTerminalSandbox":true,"toolPermission":"proceed-in-sandbox","permissions":{"allow":["read_file(/绝对路径/工作区根目录)","write_file(/绝对路径/工作区根目录)","command(env)","command(mvn)","command(git status)","command(git diff)"],"deny":["unsandboxed(*)","command(git checkout)","command(git reset)","command(git clean)","command(git commit)","command(git push)","mcp(*)","read_url(*)"]}}' \
   --output-format json \
   -p '按以下已确认边界完成编码、单测与本地构建自检闭环：
-1. 完整读取：调用文件工具必须传绝对路径；800行以内的文件一次 read_file 读完（禁止150行切片慢读）；未读到的本类尾部私有方法或关联 Mapper/DTO 签名必须先定向补读核实。
+1. 完整读取：调用文件工具必须传绝对路径；800行以内的文件一次 read_file 读完；未读到的本类尾部私有方法或关联 Mapper/DTO 签名必须先定向补读核实。
 2. 局部修改：对已有复杂业务类必须使用 edit_file 局部修改，严禁在缺失原文时调用 write_file(Overwrite=true) 全文重新生成或臆造不存在的方法。
-3. 自主构建修复：修改后直接在沙箱内运行构建测试命令（不要设 BypassSandbox=true，不要重定向到 /private/tmp，如需落盘日志写到 target/agy-build.log），若有编译或测试错误请自行定位修复，直到构建全绿后再集中返回改动摘要与测试结果。'
+3. 自主构建修复：修改后在沙箱内自主运行构建与测试，若有编译或测试错误请自行定位修复，直到测试通过后再集中返回改动摘要与测试结果。'
 ```
 
 #### （2）Codex 执行中“三不准”与长等待纪律
