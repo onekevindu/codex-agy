@@ -116,3 +116,4 @@ agy --project '<项目ID或名称>' --model 'gemini-3.8-flash-high' --mode accep
    - **铁律 1（实施与修复全面锁死 Flash High）**：AGY 实施、调试、单测、修 Bug、写文档**强制且只能使用 `gemini-3.8-flash-high`**（拥有 80%+ 的每周充裕额度）。所有调用模板中写死 `--model 'gemini-3.8-flash-high'`。
    - **铁律 2（硬性封锁 Medium 的自发调用）**：`gemini-4-argon-medium` 属于每周极度稀缺额度，**严禁 Codex 自主决定升配**！无论 Flash 遇到何种超时、复杂逻辑或未通过构建，Codex 只能汇总具体问题让 Flash 针对性解决或新开会话，**绝不允许擅自将模型提升为 Medium**。只有当**用户在对话中明确要求“使用 Medium / 旗舰模型”**时，方可使用 `gemini-4-argon-medium`。
    - **铁律 3（严禁将 Flash 长会话喂给旗舰模型）**：即使得到用户明确授权使用 Medium，**也必须开启全新的 AGY 会话**（传入 `--project` 而非 `--conversation`），并由 Codex 提取最精炼的当前状态与目标交接给 Medium。**严禁在已有 Flash 产生多步历史的旧会话中切用 Medium**，防止数百步历史上下文产生千万级 Token 乘积放大瞬间烧光旗舰周额度。
+   - **铁律 4（旗舰 Medium 额度不足自动降级 Flash）**：若用户要求使用旗舰 Medium，但调用前检查或执行中遇到配额不足/耗尽报错时，**必须立即无缝降级使用 `gemini-3.8-flash-high` 继续执行**，确保任务顺利推进且不阻塞流程。
