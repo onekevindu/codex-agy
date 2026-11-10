@@ -1,42 +1,24 @@
 # Changelog
 
-## [2.3.1] - 2026-11-10 — 补齐 `functions.wait` 续等机制与 `HEAD` + Git 暂存区 + SHA-256 精确快照回滚
+## [2.4.0] - 2026-11-10 — 移除自定义包装脚本，回归 100% 纯原生 `agy` 跨机可移植方案
 
-1. **修正超过 5 分钟时的续等机制（改用 `functions.wait` 绑定 `cell_id`）**：
-   - 当 `functions.exec` 满 5 分钟返回 `Script running with cell ID <cell_id>` 时，原 V8 `while` 循环仍在后台运行。`SKILL.md` 现明确规定此时唯一允许的操作是调用 `functions.wait({ cell_id: "<cell_id>", yield_time_ms: 300000, max_tokens: 10000 })`，严禁另开新的 `functions.exec` 对同一 `session_id` 重复调用 `write_stdin`，彻底消除双循环输出争用。
-2. **基线快照与恢复升级为完整状态校验（`HEAD` + `index_tree` + 文件 `SHA-256`）**：
-   - **Fail-Closed 基线获取**：`get_workspace_root`、`get_head_commit`、`get_index_tree`（`git write-tree`）与 `list_dirty_state`（`git status --porcelain=v1 -z`）任一失败立即抛 `BaselineError` 并返回退出码 `2`（`status: "BASELINE_ERROR"`），绝不无保护派发。
-   - **完整恢复与验真**：`agy-delegate restore` 依次恢复 `HEAD`（`git reset --soft`）、暂存区（`git read-tree <index_tree>` + `git checkout-index -f -a`）、清理新增文件、还原脏工作区文件与预删除状态，并在恢复后逐一比对 `HEAD`、`index_tree`、文件列表及每个文件的 `SHA-256`，任一步骤报错或哈希不匹配立即返回 `"ok": false` 与退出码 `1`（已通过包含 `MM` 暂存+工作区双改、未跟踪文件、预删除文件与意外 commit 的自动化测试验证）。
-3. **只读评估（`agy-delegate review`）全面封禁终端命令并增加事后哈希校验**：
-   - `review` 模式显式设置 `deny: ["write_file(*)", "command(*)", "mcp(*)", "read_url(*)"]`（依赖 AGY 原生文件读取与内置 `ripgrep` 搜索，禁止一切终端命令），并在 `review` 结束后自动校验工作区 `HEAD`、`index_tree` 与文件 `SHA-256` 是否发生任何变化。
-
----
-
-## [2.3.0] - 2026-11-10 — 用代码机制替代口头约定：V8 内置 `while` 零唤醒循环 + `agy-delegate` 确定性包装器
-
-深入排查 Codex 底层 `rollout-2026-11-09T09-53-04.jsonl` 的 `additional_tools` 声明与 205 次 `exec` 调用源码后，定位到 Codex 频繁唤醒的物理根因，并用确定性代码机制彻底替代软性文字叮嘱：
-
-1. **V8 `exec` 内置 `while` 循环，彻底消灭 30 秒空轮询唤醒**：
-   - **底层根因**：Codex 的 `tools.exec_command` 单次等待物理上限仅为 `30000 ms`（30 秒），外层 `exec`（JavaScript V8 沙箱）默认 `yield_time_ms` 也是 `30000 ms`，而 `tools.write_stdin` 空轮询最高支持 `300000 ms`（5 分钟）。此前 Codex 每次只写单行 `write_stdin(30000)` 甚至设置 `// @exec: {"yield_time_ms": 1000}`，导致每 30 秒必退回大模型重跑一次完整上下文。
-   - **机制根治**：在 `SKILL.md` 中固化带 `// @exec: {"yield_time_ms": 300000}` 头部的 V8 `while (res.session_id !== undefined)` 标准循环模板。`exec_command` 满 30 秒返回 `session_id` 后直接在 V8 内部无缝切入 `write_stdin(300000)`，**5 分钟内的任务实现 0 次模型中途唤醒**。
-2. **新增 `/Users/du/.local/bin/agy-delegate`（[bin/agy-delegate](bin/agy-delegate)）确定性包装脚本**：
-   - **自动匹配项目 ID 与明确回退归属**：自动解析 `~/.gemini/config/projects/*.json` 匹配当前工作区根目录并传入 `--project <id>`；若无匹配项目则省略 `--project`，会话归属至 `default-cli-project`（`CLI Project`）。
-   - **严格的只读评估隔离（`agy-delegate review`）**：将 `review` 模式的 `toolPermission` 显式覆盖为 `"request-review"` 并开启沙箱，禁止 `write_file(*)`，且仅使用合法的词前缀规则（`command(git status)`、`command(git diff)`、`command(git log)`、`command(git show)`）白名单放行只读 Git 命令，其余任意终端命令在 headless 模式下均被自动拒绝（修复此前在 `always-proceed` 下仅靠 `command(rm*)` 等错误 glob 黑名单无法拦截其他写命令的问题）。
-   - **自动脏工作区快照与一键无损回滚（`agy-delegate restore`）**：在 `run` / `resume` 执行前自动备份工作区已修改和未跟踪源码至 `/tmp/agy-snapshots/`，并提供 `agy-delegate restore <snapshot_dir>` 一键精确还原，物理杜绝误用 `git checkout/restore HEAD` 抹掉未提交成果。
-   - **自动校验 JSON 与 `denied_actions`**：自动解析 `agy` 返回的 JSON，若 `status != "SUCCESS"` 或 `denied_actions` 非空，直接以退出码 `2` 报错，消除退出码 `0` 软拒绝误判。
+1. **移除 `bin/agy-delegate` 外部脚本依赖，换机/分享开箱即用**：
+   - 撤除自定义包装脚本，回归纯 `SKILL.md` 单文件形态，任何机器只需安装官方 `agy` 并复制 `SKILL.md` 即可直接使用。
+2. **原生参数实现跨机免配置完整权限 + 破坏性命令拦截**：
+   - 实施与续接命令直接使用 `agy` 原生 `--mode accept-edits --disable-slash-commands --dangerously-skip-permissions` 配合 `--settings '{"permissions":{"deny":["command(git reset)","command(git checkout)","command(git restore)","command(git clean)"]}}'`（`agy` 内核保证 `--dangerously-skip-permissions` 自动放行工作区内外读写与构建命令，同时严格生效显式 `deny` 规则，无需手动修改每台电脑的 `settings.json`）。
+3. **保留 Codex V8 内置 `while` 循环 + `functions.wait` 持续等待机制**：
+   - 在 `functions.exec` 中通过 `// @exec: {"yield_time_ms": 300000}` 与 `while (res.session_id !== undefined)` 串联 `exec_command`（30s）与 `write_stdin`（300s），5 分钟内 0 次中途唤醒；超过 5 分钟返回 `Script running with cell ID <cell_id>` 时，通过 `functions.wait` 继续等待原 `cell_id`。
 
 ---
 
-## [2.2.1] - 2026-11-10 — 全局完整权限固化与 Codex 唤醒防线收口
+## [2.3.0 / 2.3.1] - 2026-11-10 — 定位 Codex V8 `exec` 30s 唤醒根因与 `functions.wait` 续等机制
 
-1. **全局权限下沉至 `settings.json`，彻底移除命令行 `--sandbox --settings` 枷锁**：
-   - 在 `~/.gemini/antigravity-cli/settings.json` 中固化全局完整权限（`"toolPermission": "always-proceed"`, `"allowNonWorkspaceAccess": true`, `"enableTerminalSandbox": false`），并清理 `~/.gemini/config/projects/*.json` 中残留的项目级询问策略。
-2. **收紧对 Codex 自身行为的硬性约束**：
-   - 补齐纯续等铁律、JSON `denied_actions` 完成判定、职责红线（生产/测试代码始终由 AGY 修改，Codex 绝不亲自下场写代码）及细节修正。
+- 排查 `rollout-2026-11-09T09-53-04.jsonl` 的 `additional_tools` 声明与 205 次 `exec` 调用源码，确认 `tools.exec_command` 单次等待物理上限为 `30000 ms`，而 `tools.write_stdin` 空轮询支持 `300000 ms`（5 分钟）；确立 V8 内置 `while` 循环 + 超时后 `functions.wait` 绑定 `cell_id` 的标准等待范式。
+- 修正只读评估（`deny: ["write_file(*)", "command(*)", "mcp(*)", "read_url(*)"]`）与 `--project` 省略时归属 `default-cli-project` 的机制说明。
 
 ---
 
-## [2.2.0] - 2026-11-10 — 彻底去微观管理化（不把 AGY 当傻子：只定目标与边界，不做过度限制与过度指导）
+## [2.2.0 / 2.2.1] - 2026-11-10 — 彻底去微观管理化（不把 AGY 当傻子：只定目标与边界）
 
 - 移除提示词中对 AGY 工具用法的琐碎说教（如“≤800行一次读完”、“必须传绝对路径”、“核实真实签名”、“日志写到 `target/`”等），回归“委托前定目标与边界 $\rightarrow$ 执行中 AGY 自治闭环 $\rightarrow$ 交付后一次集中终验 $\rightarrow$ 阻塞时定向排障”的四阶段极简契约。
 
