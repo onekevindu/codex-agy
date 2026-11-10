@@ -32,13 +32,15 @@ cp codex-agy/SKILL.md ~/.codex/skills/codex-agy/SKILL.md
 
 若想在另一个终端窗口实时观察 AGY 当前正在调用的工具、修改的文件与思考过程（100% 只读旁路，零侵入，不干扰 Codex 与 AGY 自动化流程）：
 
-### 方式 1：执行仓库内置脚本
+### 方式 1：执行仓库内置脚本（推荐，支持跨会话自动切换）
+`bin/agy-watch` 使用 Python 标准库实现，无需安装 `jq`，且**支持跨会话自动切换**（当一次会话结束、新一轮会话启动时，会自动检测并切换监听最新会话，无需每次手动 Ctrl+C 重启）：
 ```bash
 ./bin/agy-watch
 ```
-*(也可将脚本软链或拷贝至 PATH：`cp bin/agy-watch ~/.local/bin/`，之后即可直接使用 `agy-watch`)*
+*(也可将脚本软链或拷贝至 PATH：`cp bin/agy-watch ~/.local/bin/`，之后在任何目录直接敲 `agy-watch` 即可)*
 
-### 方式 2：终端原始单行命令（免安装）
+### 方式 2：终端原始单行命令（单会话静态跟踪，免安装）
+*(注：原始单行命令绑定于启动瞬间抓到的特定日志文件，会话结束后需重新执行以跟踪下一会话)*
 ```bash
 tail -n 30 -f "$(ls -t ~/.gemini/antigravity-cli/brain/*/.system_generated/logs/transcript.jsonl | head -n 1)" | jq --unbuffered -r '
   def c_dim(s): "\u001b[90m" + s + "\u001b[0m";
