@@ -219,6 +219,18 @@ def restore_snapshot(snap_dir_str: str) -> int:
         print(json.dumps({"ok": False, "error": f"Invalid manifest: {e}"}))
         return 1
 
+    def fail_immediately(err_list):
+        print(json.dumps({
+            "ok": False,
+            "restored_snapshot": str(snap_dir),
+            "workspace": str(ws_root),
+            "head_commit": head_commit,
+            "index_tree": index_tree,
+            "errors": err_list,
+            "git_status": git_short_status(ws_root),
+        }, ensure_ascii=False, indent=2))
+        return 1
+
     # Verify all saved snapshot files exist and match recorded hashes BEFORE modifying workspace
     files_dir = snap_dir / "files"
     for rel in saved_files:
@@ -230,10 +242,9 @@ def restore_snapshot(snap_dir_str: str) -> int:
             if actual_hash != file_hashes[rel]:
                 errors.append(f"Snapshot file hash mismatch for {rel}")
     if errors:
-        print(json.dumps({"ok": False, "errors": errors}, ensure_ascii=False, indent=2))
-        return 1
+        return fail_immediately(errors)
 
-    # 1. Restore HEAD commit if moved
+    # 1. Restore HEAD commit if moved (fail-fast)
     try:
         cur_head = get_head_commit(ws_root)
         if cur_head != head_commit:
@@ -245,11 +256,11 @@ def restore_snapshot(snap_dir_str: str) -> int:
                 text=True,
             )
             if p.returncode != 0:
-                errors.append(f"git reset --soft {head_commit} failed: {p.stderr.strip()}")
+                return fail_immediately([f"git reset --soft {head_commit} failed: {p.stderr.strip()}"])
     except BaselineError as e:
-        errors.append(str(e))
+        return fail_immediately([str(e)])
 
-    # 2. Restore exact Git index (staging area) from index_tree and checkout tracked files from index
+    # 2. Restore exact Git index (staging area) from index_tree and checkout tracked files (fail-fast)
     p_rt = subprocess.run(
         ["git", "read-tree", index_tree],
         cwd=str(ws_root),
@@ -258,7 +269,7 @@ def restore_snapshot(snap_dir_str: str) -> int:
         text=True,
     )
     if p_rt.returncode != 0:
-        errors.append(f"git read-tree {index_tree} failed: {p_rt.stderr.strip()}")
+        return fail_immediately([f"git read-tree {index_tree} failed: {p_rt.stderr.strip()}"])
 
     p_co = subprocess.run(
         ["git", "checkout-index", "-f", "-a"],
@@ -268,14 +279,13 @@ def restore_snapshot(snap_dir_str: str) -> int:
         text=True,
     )
     if p_co.returncode != 0:
-        errors.append(f"git checkout-index -f -a failed: {p_co.stderr.strip()}")
+        return fail_immediately([f"git checkout-index -f -a failed: {p_co.stderr.strip()}"])
 
-    # 3. Remove any files present in dirty state that were not in saved_files or pre_deleted_files
+    # 3. Remove any files present in dirty state that were not in saved_files or pre_deleted_files (fail-fast)
     try:
         current_existing, current_deleted = list_dirty_state(ws_root)
     except BaselineError as e:
-        print(json.dumps({"ok": False, "error": str(e)}))
-        return 1
+        return fail_immediately([str(e)])
 
     saved_set = set(saved_files)
     pre_deleted_set = set(pre_deleted_files)
@@ -286,9 +296,9 @@ def restore_snapshot(snap_dir_str: str) -> int:
             try:
                 full.unlink()
             except Exception as e:
-                errors.append(f"Failed to remove extra file {rel}: {e}")
+                return fail_immediately([f"Failed to remove extra file {rel}: {e}"])
 
-    # 4. Restore saved dirty/untracked files from snapshot
+    # 4. Restore saved dirty/untracked files from snapshot (fail-fast)
     for rel in saved_files:
         src = files_dir / rel
         dst = ws_root / rel
@@ -298,16 +308,16 @@ def restore_snapshot(snap_dir_str: str) -> int:
                 dst.unlink()
             shutil.copy2(src, dst, follow_symlinks=False)
         except Exception as e:
-            errors.append(f"Failed to restore file {rel}: {e}")
+            return fail_immediately([f"Failed to restore file {rel}: {e}"])
 
-    # 5. Ensure pre-deleted files remain deleted in working tree
+    # 5. Ensure pre-deleted files remain deleted in working tree (fail-fast)
     for rel in pre_deleted_files:
         dst = ws_root / rel
         if dst.exists() or dst.is_symlink():
             try:
                 dst.unlink()
             except Exception as e:
-                errors.append(f"Failed to delete {rel}: {e}")
+                return fail_immediately([f"Failed to delete {rel}: {e}"])
 
     # 6. Post-restore verification: HEAD, index_tree, dirty file lists, and SHA-256 hashes
     try:
