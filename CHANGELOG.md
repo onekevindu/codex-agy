@@ -8,7 +8,8 @@
    - **底层根因**：Codex 的 `tools.exec_command` 单次等待物理上限仅为 `30000 ms`（30 秒），外层 `exec`（JavaScript V8 沙箱）默认 `yield_time_ms` 也是 `30000 ms`，而 `tools.write_stdin` 空轮询最高支持 `300000 ms`（5 分钟）。此前 Codex 每次只写单行 `write_stdin(30000)` 甚至设置 `// @exec: {"yield_time_ms": 1000}`，导致每 30 秒必退回大模型重跑一次完整上下文。
    - **机制根治**：在 `SKILL.md` 中固化带 `// @exec: {"yield_time_ms": 300000}` 头部的 V8 `while (res.session_id !== undefined)` 标准循环模板。`exec_command` 满 30 秒返回 `session_id` 后直接在 V8 内部无缝切入 `write_stdin(300000)`，**5 分钟内的任务实现 0 次模型中途唤醒**。
 2. **新增 `/Users/du/.local/bin/agy-delegate`（[bin/agy-delegate](bin/agy-delegate)）确定性包装脚本**：
-   - **自动匹配项目 ID**：自动解析 `~/.gemini/config/projects/*.json` 匹配当前工作区根目录，免去 Codex 每次手写脚本查配置。
+   - **自动匹配项目 ID 与明确回退归属**：自动解析 `~/.gemini/config/projects/*.json` 匹配当前工作区根目录并传入 `--project <id>`；若无匹配项目则省略 `--project`，会话归属至 `default-cli-project`（`CLI Project`）。
+   - **严格的只读评估隔离（`agy-delegate review`）**：将 `review` 模式的 `toolPermission` 显式覆盖为 `"request-review"` 并开启沙箱，禁止 `write_file(*)`，且仅使用合法的词前缀规则（`command(git status)`、`command(git diff)`、`command(git log)`、`command(git show)`）白名单放行只读 Git 命令，其余任意终端命令在 headless 模式下均被自动拒绝（修复此前在 `always-proceed` 下仅靠 `command(rm*)` 等错误 glob 黑名单无法拦截其他写命令的问题）。
    - **自动脏工作区快照与一键无损回滚（`agy-delegate restore`）**：在 `run` / `resume` 执行前自动备份工作区已修改和未跟踪源码至 `/tmp/agy-snapshots/`，并提供 `agy-delegate restore <snapshot_dir>` 一键精确还原，物理杜绝误用 `git checkout/restore HEAD` 抹掉未提交成果。
    - **自动校验 JSON 与 `denied_actions`**：自动解析 `agy` 返回的 JSON，若 `status != "SUCCESS"` 或 `denied_actions` 非空，直接以退出码 `2` 报错，消除退出码 `0` 软拒绝误判。
 

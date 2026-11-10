@@ -10,7 +10,7 @@ description: 通过 Antigravity CLI（agy）及确定性包装器 agy-delegate �
 **不要把 AGY 当傻子，Codex 不要过度限制，也不要过度指导；用确定性工具机制代替口头约定。**
 本机 `~/.gemini/antigravity-cli/settings.json` 已全局配置完整权限（`"toolPermission": "always-proceed"`, `"allowNonWorkspaceAccess": true`, `"enableTerminalSandbox": false`），并安装了确定性包装器 `/Users/du/.local/bin/agy-delegate`。
 
-- **委托前**：Codex 只明确**业务目标、必要设计、不可变边界和验收条件**。不替 AGY 全量预读源码，不在提示词里教 AGY 怎么调工具；无需手写脚本查项目 ID 或打快照（`agy-delegate` 会自动匹配 `--project` 并在执行前自动把脏工作区快照备份到 `/tmp/agy-snapshots/`）。
+- **委托前**：Codex 只明确**业务目标、必要设计、不可变边界和验收条件**。不替 AGY 全量预读源码，不在提示词里教 AGY 怎么调工具；无需手写脚本查项目 ID 或打快照（`agy-delegate` 会优先从 `~/.gemini/config/projects/*.json` 匹配当前仓库目录对应的 `--project <id>`，无匹配时省略 `--project` 回退归属至 `default-cli-project`，并在写操作前自动把脏工作区快照备份到 `/tmp/agy-snapshots/`）。
 - **执行中（V8 循环零唤醒等待）**：单层直派单个 AGY 会话，由 AGY 自主完成阅读、编码、运行测试与局部纠错。Codex 在 `exec`（JavaScript V8 工具）中必须加首行 `// @exec: {"yield_time_ms": 300000}` 并使用 `while (res.session_id !== undefined)` 循环调用 `write_stdin`，在 V8 沙箱内直接阻塞等完（最长 5 分钟零模型唤醒），严禁每 30 秒返回模型轮询，严禁读取 `~/.gemini/` 内部日志，严禁按读取次数或耗时催写。
 - **交付后**：`agy-delegate` 会自动校验退出码、`status`、`denied_actions` 与 `error` 并输出结构化 JSON（若有软拒绝直接返回退出码 `2`）。Codex 核对返回的 JSON 后，集中审查 `git diff` 并做独立验证；若有遗漏问题，使用返回的 `conversation_id` 一次性汇总交回修复。
 - **职责红线与安全回滚**：
@@ -87,7 +87,7 @@ agy-delegate resume '<conversation_id>' --model gemini-3.8-flash-high '验证发
 
 ### 4. 可行性评估（`agy-delegate review`，仅复杂方案按需触发）
 
-常规任务直接进入实施。仅当涉及复杂架构、跨服务契约或状态机改造时，做单轮只读评估（`agy-delegate review` 内部自动附加只读 `--settings`，保留代码读取、内置 `ripgrep` 与只读 Git 检索，物理禁止文件写入与破坏性命令）：
+常规任务直接进入实施。仅当涉及复杂架构、跨服务契约或状态机改造时，做单轮只读评估。`agy-delegate review` 内部会将 `toolPermission` 覆盖为 `"request-review"`、开启终端沙箱，设置 `deny: ["write_file(*)", "mcp(*)", "read_url(*)"]`，且仅按词前缀白名单放行只读 Git 命令（`command(git status)`、`command(git diff)`、`command(git log)`、`command(git show)`），其余未授权终端命令在 headless 模式下均会被自动拒绝：
 
 ```bash
 agy-delegate review --model gemini-4-argon-medium '评估以下方案的可行性，对照现有代码指出潜在冲突、遗漏边界和修正建议：<方案摘要>'

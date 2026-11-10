@@ -18,18 +18,21 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 READONLY_SETTINGS = json.dumps({
+    "toolPermission": "request-review",
+    "enableTerminalSandbox": True,
     "permissions": {
+        "allow": [
+            "command(git status)",
+            "command(git diff)",
+            "command(git log)",
+            "command(git show)",
+        ],
         "deny": [
             "write_file(*)",
-            "command(rm*)",
-            "command(git reset*)",
-            "command(git checkout*)",
-            "command(git restore*)",
-            "command(git clean*)",
-            "command(git commit*)",
-            "command(git push*)",
-        ]
-    }
+            "mcp(*)",
+            "read_url(*)",
+        ],
+    },
 }, separators=(",", ":"))
 
 
