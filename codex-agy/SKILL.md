@@ -50,7 +50,7 @@ const settings = JSON.stringify({
 });
 const q = s => "'" + s.replaceAll("'", "'\\''") + "'";
 let res = await tools.exec_command({
-  cmd: `agy --project '<项目ID或名称>' --model '<中档 High 模型 ID>' --mode accept-edits --disable-slash-commands --dangerously-skip-permissions --settings ${q(settings)} --output-format json -p ${q(prompt)}`,
+  cmd: `agy --project '<项目ID或名称>' --model 'gemini-3.8-flash-high' --mode accept-edits --disable-slash-commands --dangerously-skip-permissions --settings ${q(settings)} --output-format json -p ${q(prompt)}`,
   yield_time_ms: 30000,
   max_output_tokens: 10000
 });
@@ -82,23 +82,24 @@ text(out);
 
 ### 3. 续接返工
 
-交付后若验证发现遗漏问题，使用上一轮 JSON 返回的 `conversation_id` 一次性交回修复（同样放在第 1 节的 V8 `while` 循环模板中执行）：
+交付后若验证发现遗漏问题，使用上一轮 JSON 返回的 `conversation_id` 一次性交回修复（同样放在第 1 节的 V8 `while` 循环模板中执行，**强制使用 `gemini-3.8-flash-high`**）：
 
 ```bash
-agy --conversation '<conversation_id>' --model '<中档 High 模型 ID>' --mode accept-edits --disable-slash-commands --dangerously-skip-permissions \
+agy --conversation '<conversation_id>' --model 'gemini-3.8-flash-high' --mode accept-edits --disable-slash-commands --dangerously-skip-permissions \
   --settings '{"permissions":{"deny":["command(git reset)","command(git checkout)","command(git restore)","command(git clean)"]}}' \
   --output-format json \
   -p '验证发现以下问题，请一并修复并重新自检通过：<问题列表>'
 ```
 
-- **上下文切换**：不监控内部 token 计数；仅当多轮续接后出现明显上下文遗忘或重复报错打转时，开启新会话并交接已完成改动与剩余问题。
+- **上下文重置**：不监控内部 token 计数；若多轮续接后会话步数过多（出现上下文遗忘或超时中断），**开启全新会话并使用 `--model 'gemini-3.8-flash-high'`**，把当前基线成果与剩余问题交接给新会话。
+- **微小修补禁止外包**：若仅为极小范围的文档拼写校正、路径修正或单行常量调整，由 Codex 直接修改并验证，严禁拉起 AGY 产生多余开销。
 
 ### 4. 可行性评估（仅复杂方案按需触发）
 
-常规任务直接进入实施。仅当涉及复杂架构、跨服务契约或状态机改造时，做单轮只读评估（禁止文件写入与一切终端命令，仅使用 AGY 原生文件读取与内置 `ripgrep` 搜索）：
+常规任务直接进入实施。仅当涉及复杂架构、跨服务契约或状态机改造时，做单轮只读评估（禁止文件写入与一切终端命令，仅使用 AGY 原生文件读取与内置 `ripgrep` 搜索）。评估默认仍使用 `gemini-3.8-flash-high`；仅在用户明确要求使用旗舰模型时才传 `gemini-4-argon-medium`：
 
 ```bash
-agy --project '<项目ID或名称>' --model '<旗舰 Medium 模型 ID>' --mode accept-edits --disable-slash-commands --sandbox \
+agy --project '<项目ID或名称>' --model 'gemini-3.8-flash-high' --mode accept-edits --disable-slash-commands --sandbox \
   --settings '{"allowNonWorkspaceAccess":false,"enableTerminalSandbox":true,"toolPermission":"request-review","permissions":{"deny":["write_file(*)","command(*)","mcp(*)","read_url(*)"]}}' \
   --output-format json \
   -p '评估以下方案的可行性，对照现有代码指出潜在冲突、遗漏边界和修正建议：<方案摘要>'
@@ -111,4 +112,7 @@ agy --project '<项目ID或名称>' --model '<旗舰 Medium 模型 ID>' --mode a
 1. **项目归属**：始终在目标仓库根目录启动 `agy`。
    - 优先从 `~/.gemini/config/projects/*.json` 查找 `folderUri` 匹配当前仓库根目录的项目 `id` 传入 `--project '<项目ID>'`；
    - 若无匹配项目，可传 `--new-project '<仓库目录名>'` 创建对应项目，或省略 `--project`（省略时会话归属至 `default-cli-project`）。
-2. **模型与额度**：仅在当前对话首次使用 AGY 或遇到配额报错时查一次 `agy models` 与 `agy -p '/usage'`。复杂方案只读评估优先选有额度的旗舰模型 Medium（如 `gemini-4-argon-medium`）；实施与修复优先选中档模型 High（如 `gemini-3.8-flash-high`）或旗舰 Medium。
+2. **模型与配额铁律（防爆锁）**：
+   - **铁律 1（实施与修复全面锁死 Flash High）**：AGY 实施、调试、单测、修 Bug、写文档**强制且只能使用 `gemini-3.8-flash-high`**（拥有 80%+ 的每周充裕额度）。所有调用模板中写死 `--model 'gemini-3.8-flash-high'`。
+   - **铁律 2（硬性封锁 Medium 的自发调用）**：`gemini-4-argon-medium` 属于每周极度稀缺额度，**严禁 Codex 自主决定升配**！无论 Flash 遇到何种超时、复杂逻辑或未通过构建，Codex 只能汇总具体问题让 Flash 针对性解决或新开会话，**绝不允许擅自将模型提升为 Medium**。只有当**用户在对话中明确要求“使用 Medium / 旗舰模型”**时，方可使用 `gemini-4-argon-medium`。
+   - **铁律 3（严禁将 Flash 长会话喂给旗舰模型）**：即使得到用户明确授权使用 Medium，**也必须开启全新的 AGY 会话**（传入 `--project` 而非 `--conversation`），并由 Codex 提取最精炼的当前状态与目标交接给 Medium。**严禁在已有 Flash 产生多步历史的旧会话中切用 Medium**，防止数百步历史上下文产生千万级 Token 乘积放大瞬间烧光旗舰周额度。
