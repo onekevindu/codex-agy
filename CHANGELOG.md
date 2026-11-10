@@ -1,5 +1,17 @@
 # Changelog
 
+## [2.3.1] - 2026-11-10 — 补齐 `functions.wait` 续等机制与 `HEAD` + Git 暂存区 + SHA-256 精确快照回滚
+
+1. **修正超过 5 分钟时的续等机制（改用 `functions.wait` 绑定 `cell_id`）**：
+   - 当 `functions.exec` 满 5 分钟返回 `Script running with cell ID <cell_id>` 时，原 V8 `while` 循环仍在后台运行。`SKILL.md` 现明确规定此时唯一允许的操作是调用 `functions.wait({ cell_id: "<cell_id>", yield_time_ms: 300000, max_tokens: 10000 })`，严禁另开新的 `functions.exec` 对同一 `session_id` 重复调用 `write_stdin`，彻底消除双循环输出争用。
+2. **基线快照与恢复升级为完整状态校验（`HEAD` + `index_tree` + 文件 `SHA-256`）**：
+   - **Fail-Closed 基线获取**：`get_workspace_root`、`get_head_commit`、`get_index_tree`（`git write-tree`）与 `list_dirty_state`（`git status --porcelain=v1 -z`）任一失败立即抛 `BaselineError` 并返回退出码 `2`（`status: "BASELINE_ERROR"`），绝不无保护派发。
+   - **完整恢复与验真**：`agy-delegate restore` 依次恢复 `HEAD`（`git reset --soft`）、暂存区（`git read-tree <index_tree>` + `git checkout-index -f -a`）、清理新增文件、还原脏工作区文件与预删除状态，并在恢复后逐一比对 `HEAD`、`index_tree`、文件列表及每个文件的 `SHA-256`，任一步骤报错或哈希不匹配立即返回 `"ok": false` 与退出码 `1`（已通过包含 `MM` 暂存+工作区双改、未跟踪文件、预删除文件与意外 commit 的自动化测试验证）。
+3. **只读评估（`agy-delegate review`）全面封禁终端命令并增加事后哈希校验**：
+   - `review` 模式显式设置 `deny: ["write_file(*)", "command(*)", "mcp(*)", "read_url(*)"]`（依赖 AGY 原生文件读取与内置 `ripgrep` 搜索，禁止一切终端命令），并在 `review` 结束后自动校验工作区 `HEAD`、`index_tree` 与文件 `SHA-256` 是否发生任何变化。
+
+---
+
 ## [2.3.0] - 2026-11-10 — 用代码机制替代口头约定：V8 内置 `while` 零唤醒循环 + `agy-delegate` 确定性包装器
 
 深入排查 Codex 底层 `rollout-2026-11-09T09-53-04.jsonl` 的 `additional_tools` 声明与 205 次 `exec` 调用源码后，定位到 Codex 频繁唤醒的物理根因，并用确定性代码机制彻底替代软性文字叮嘱：

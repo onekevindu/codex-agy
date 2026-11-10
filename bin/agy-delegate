@@ -2,13 +2,16 @@
 """
 agy-delegate: Deterministic wrapper for Codex -> AGY delegation.
 - Automatically resolves --project <id> from ~/.gemini/config/projects/*.json matching current workspace
-- Automatically snapshots dirty/untracked non-ignored workspace files before write runs (preventing git HEAD rollback loss)
-- Provides `agy-delegate restore <snapshot_dir>` for 1-click safe rollback to pre-delegation state
-- Enforces --mode accept-edits --disable-slash-commands --output-format json
-- Validates JSON output (status, conversation_id, denied_actions, error) and exits non-zero on soft-denials
+  (falls back to omitting --project, which assigns the session to default-cli-project)
+- Strictly snapshots workspace state before write runs: HEAD commit, Git index tree (staging area),
+  and SHA-256 verified copies of all dirty/untracked non-ignored files. Fails closed if baseline capture fails.
+- Provides `agy-delegate restore <snapshot_dir>` with full post-restore verification (HEAD, index tree, file hashes).
+- Enforces strict read-only settings in `review` mode (denying write_file(*), command(*), mcp(*), read_url(*)).
+- Validates JSON output (status, conversation_id, denied_actions, error) and exits non-zero on soft-denials.
 """
 import argparse
 import datetime
+import hashlib
 import json
 import os
 import shutil
@@ -18,17 +21,13 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 READONLY_SETTINGS = json.dumps({
-    "toolPermission": "request-review",
+    "allowNonWorkspaceAccess": False,
     "enableTerminalSandbox": True,
+    "toolPermission": "request-review",
     "permissions": {
-        "allow": [
-            "command(git status)",
-            "command(git diff)",
-            "command(git log)",
-            "command(git show)",
-        ],
         "deny": [
             "write_file(*)",
+            "command(*)",
             "mcp(*)",
             "read_url(*)",
         ],
@@ -36,18 +35,56 @@ READONLY_SETTINGS = json.dumps({
 }, separators=(",", ":"))
 
 
+class BaselineError(RuntimeError):
+    pass
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def get_workspace_root() -> Path:
-    try:
-        out = subprocess.check_output(
-            ["git", "rev-parse", "--show-toplevel"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-        ).strip()
-        if out:
-            return Path(out).resolve()
-    except Exception:
-        pass
-    return Path.cwd().resolve()
+    proc = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if proc.returncode != 0 or not proc.stdout.strip():
+        raise BaselineError(
+            f"Current directory is not a valid Git repository: {(proc.stderr or '').strip()}"
+        )
+    return Path(proc.stdout.strip()).resolve()
+
+
+def get_head_commit(ws_root: Path) -> str:
+    proc = subprocess.run(
+        ["git", "rev-parse", "--verify", "HEAD"],
+        cwd=str(ws_root),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if proc.returncode != 0:
+        raise BaselineError(f"Failed to read git HEAD: {(proc.stderr or '').strip()}")
+    return proc.stdout.strip()
+
+
+def get_index_tree(ws_root: Path) -> str:
+    proc = subprocess.run(
+        ["git", "write-tree"],
+        cwd=str(ws_root),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if proc.returncode != 0:
+        raise BaselineError(f"Failed to write-tree for Git index: {(proc.stderr or '').strip()}")
+    return proc.stdout.strip()
 
 
 def resolve_project_id(ws_root: Path) -> str:
@@ -88,58 +125,72 @@ def resolve_project_id(ws_root: Path) -> str:
 
 
 def list_dirty_state(ws_root: Path):
-    """Return (existing_dirty_rel_paths, deleted_rel_paths) for current workspace."""
-    try:
-        raw = subprocess.check_output(
-            ["git", "status", "--porcelain", "-z", "--untracked-files=all"],
-            cwd=str(ws_root),
-            stderr=subprocess.DEVNULL,
+    """Return (existing_dirty_rel_paths, deleted_rel_paths). Raises BaselineError if git status fails."""
+    proc = subprocess.run(
+        ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        cwd=str(ws_root),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if proc.returncode != 0:
+        raise BaselineError(
+            f"git status failed (exit {proc.returncode}): {proc.stderr.decode('utf-8', errors='replace').strip()}"
         )
-    except Exception:
-        return [], []
+    raw = proc.stdout
     if not raw:
         return [], []
 
-    entries = raw.decode("utf-8", errors="replace").split("\0")
+    entries = raw.decode("utf-8", errors="surrogateescape").split("\0")
     existing = []
     deleted = []
     i = 0
     while i < len(entries):
         entry = entries[i]
-        if not entry or len(entry) < 4:
+        if not entry:
             i += 1
             continue
+        if len(entry) < 4:
+            raise BaselineError(f"Unexpected git status entry format: {entry!r}")
         status = entry[:2]
         rel_path = entry[3:]
         if "R" in status or "C" in status:
             i += 1
         full_path = ws_root / rel_path
-        if full_path.exists() and full_path.is_file():
+        if full_path.is_symlink() or full_path.is_file():
             existing.append(rel_path)
         elif not full_path.exists():
             deleted.append(rel_path)
         i += 1
-    return existing, deleted
+    return sorted(set(existing)), sorted(set(deleted))
 
 
-def snapshot_dirty_workspace(ws_root: Path) -> str:
-    """Snapshot current dirty state (modified + untracked non-ignored files) before AGY runs."""
+def snapshot_workspace(ws_root: Path) -> str:
+    """Capture complete baseline: HEAD commit, index tree, and all dirty/untracked files with SHA-256."""
+    head_commit = get_head_commit(ws_root)
+    index_tree = get_index_tree(ws_root)
     files_to_save, deleted_files = list_dirty_state(ws_root)
-    ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+
+    ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     snap_dir = Path("/tmp/agy-snapshots") / f"{ws_root.name}-{ts}"
     files_dir = snap_dir / "files"
     files_dir.mkdir(parents=True, exist_ok=True)
 
+    file_hashes = {}
     for rel in files_to_save:
         src = ws_root / rel
         dst = files_dir / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dst)
+        shutil.copy2(src, dst, follow_symlinks=False)
+        if not dst.is_symlink():
+            file_hashes[rel] = sha256_file(dst)
 
     manifest = {
         "workspace": str(ws_root),
         "timestamp": ts,
+        "head_commit": head_commit,
+        "index_tree": index_tree,
         "saved_files": files_to_save,
+        "file_hashes": file_hashes,
         "pre_deleted_files": deleted_files,
     }
     (snap_dir / "manifest.json").write_text(
@@ -155,67 +206,151 @@ def restore_snapshot(snap_dir_str: str) -> int:
         print(json.dumps({"ok": False, "error": f"Manifest not found: {manifest_path}"}))
         return 1
 
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    ws_root = Path(manifest["workspace"]).resolve()
-    saved_set = set(manifest.get("saved_files", []))
-    pre_deleted_set = set(manifest.get("pre_deleted_files", []))
+    errors = []
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        ws_root = Path(manifest["workspace"]).resolve()
+        head_commit = manifest["head_commit"]
+        index_tree = manifest["index_tree"]
+        saved_files = manifest.get("saved_files", [])
+        file_hashes = manifest.get("file_hashes", {})
+        pre_deleted_files = manifest.get("pre_deleted_files", [])
+    except Exception as e:
+        print(json.dumps({"ok": False, "error": f"Invalid manifest: {e}"}))
+        return 1
 
-    current_existing, current_deleted = list_dirty_state(ws_root)
-    all_touched = (set(current_existing) | set(current_deleted)) - saved_set - pre_deleted_set
-
-    # 1. Revert any newly modified/deleted tracked files or remove newly created untracked files
-    for rel in sorted(all_touched):
-        full = ws_root / rel
-        in_head = subprocess.run(
-            ["git", "cat-file", "-e", f"HEAD:{rel}"],
-            cwd=str(ws_root),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        ).returncode == 0
-        if in_head:
-            subprocess.run(
-                ["git", "checkout", "HEAD", "--", rel],
-                cwd=str(ws_root),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        elif full.exists():
-            full.unlink()
-
-    # 2. Restore saved dirty/untracked files from snapshot
+    # Verify all saved snapshot files exist and match recorded hashes BEFORE modifying workspace
     files_dir = snap_dir / "files"
-    for rel in sorted(saved_set):
+    for rel in saved_files:
+        src = files_dir / rel
+        if not src.exists() and not src.is_symlink():
+            errors.append(f"Missing snapshot file: {src}")
+        elif rel in file_hashes and not src.is_symlink():
+            actual_hash = sha256_file(src)
+            if actual_hash != file_hashes[rel]:
+                errors.append(f"Snapshot file hash mismatch for {rel}")
+    if errors:
+        print(json.dumps({"ok": False, "errors": errors}, ensure_ascii=False, indent=2))
+        return 1
+
+    # 1. Restore HEAD commit if moved
+    try:
+        cur_head = get_head_commit(ws_root)
+        if cur_head != head_commit:
+            p = subprocess.run(
+                ["git", "reset", "--soft", head_commit],
+                cwd=str(ws_root),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            if p.returncode != 0:
+                errors.append(f"git reset --soft {head_commit} failed: {p.stderr.strip()}")
+    except BaselineError as e:
+        errors.append(str(e))
+
+    # 2. Restore exact Git index (staging area) from index_tree and checkout tracked files from index
+    p_rt = subprocess.run(
+        ["git", "read-tree", index_tree],
+        cwd=str(ws_root),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if p_rt.returncode != 0:
+        errors.append(f"git read-tree {index_tree} failed: {p_rt.stderr.strip()}")
+
+    p_co = subprocess.run(
+        ["git", "checkout-index", "-f", "-a"],
+        cwd=str(ws_root),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if p_co.returncode != 0:
+        errors.append(f"git checkout-index -f -a failed: {p_co.stderr.strip()}")
+
+    # 3. Remove any files present in dirty state that were not in saved_files or pre_deleted_files
+    try:
+        current_existing, current_deleted = list_dirty_state(ws_root)
+    except BaselineError as e:
+        print(json.dumps({"ok": False, "error": str(e)}))
+        return 1
+
+    saved_set = set(saved_files)
+    pre_deleted_set = set(pre_deleted_files)
+    extra_files = set(current_existing) - saved_set - pre_deleted_set
+    for rel in sorted(extra_files):
+        full = ws_root / rel
+        if full.exists() or full.is_symlink():
+            try:
+                full.unlink()
+            except Exception as e:
+                errors.append(f"Failed to remove extra file {rel}: {e}")
+
+    # 4. Restore saved dirty/untracked files from snapshot
+    for rel in saved_files:
         src = files_dir / rel
         dst = ws_root / rel
-        if src.is_file():
+        try:
             dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, dst)
+            if dst.exists() or dst.is_symlink():
+                dst.unlink()
+            shutil.copy2(src, dst, follow_symlinks=False)
+        except Exception as e:
+            errors.append(f"Failed to restore file {rel}: {e}")
 
-    # 3. Ensure pre-deleted files remain deleted
-    for rel in sorted(pre_deleted_set):
+    # 5. Ensure pre-deleted files remain deleted in working tree
+    for rel in pre_deleted_files:
         dst = ws_root / rel
-        if dst.exists():
-            dst.unlink()
+        if dst.exists() or dst.is_symlink():
+            try:
+                dst.unlink()
+            except Exception as e:
+                errors.append(f"Failed to delete {rel}: {e}")
 
+    # 6. Post-restore verification: HEAD, index_tree, dirty file lists, and SHA-256 hashes
+    try:
+        post_head = get_head_commit(ws_root)
+        post_tree = get_index_tree(ws_root)
+        post_existing, post_deleted = list_dirty_state(ws_root)
+        if post_head != head_commit:
+            errors.append(f"Post-restore HEAD mismatch: expected {head_commit}, got {post_head}")
+        if post_tree != index_tree:
+            errors.append(f"Post-restore index tree mismatch: expected {index_tree}, got {post_tree}")
+        if post_existing != saved_files:
+            errors.append(f"Post-restore dirty files mismatch: expected {saved_files}, got {post_existing}")
+        if post_deleted != pre_deleted_files:
+            errors.append(f"Post-restore deleted files mismatch: expected {pre_deleted_files}, got {post_deleted}")
+        for rel, exp_hash in file_hashes.items():
+            dst = ws_root / rel
+            if not dst.is_file() or sha256_file(dst) != exp_hash:
+                errors.append(f"Post-restore SHA-256 mismatch for {rel}")
+    except Exception as e:
+        errors.append(f"Post-restore verification failed: {e}")
+
+    ok = len(errors) == 0
     print(json.dumps({
-        "ok": True,
+        "ok": ok,
         "restored_snapshot": str(snap_dir),
         "workspace": str(ws_root),
+        "head_commit": head_commit,
+        "index_tree": index_tree,
+        "errors": errors,
         "git_status": git_short_status(ws_root),
     }, ensure_ascii=False, indent=2))
-    return 0
+    return 0 if ok else 1
 
 
 def git_short_status(ws_root: Path) -> str:
-    try:
-        return subprocess.check_output(
-            ["git", "status", "--short"],
-            cwd=str(ws_root),
-            stderr=subprocess.DEVNULL,
-            text=True,
-        ).strip()
-    except Exception:
-        return ""
+    proc = subprocess.run(
+        ["git", "status", "--short"],
+        cwd=str(ws_root),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    return proc.stdout.strip() if proc.returncode == 0 else ""
 
 
 def main() -> int:
@@ -249,9 +384,17 @@ def main() -> int:
     if args.subcommand == "restore":
         return restore_snapshot(args.snapshot_dir)
 
-    ws_root = get_workspace_root()
-    project_id = getattr(args, "project", "") or resolve_project_id(ws_root)
-    snapshot_dir = ""
+    try:
+        ws_root = get_workspace_root()
+        project_id = getattr(args, "project", "") or resolve_project_id(ws_root)
+        snapshot_dir = snapshot_workspace(ws_root)
+    except BaselineError as e:
+        print(json.dumps({
+            "ok": False,
+            "status": "BASELINE_ERROR",
+            "error": str(e),
+        }, ensure_ascii=False, indent=2))
+        return 2
 
     cmd = ["agy"]
     if args.subcommand in ("run", "review") and project_id:
@@ -269,8 +412,6 @@ def main() -> int:
 
     if args.subcommand == "review":
         cmd.extend(["--settings", READONLY_SETTINGS])
-    else:
-        snapshot_dir = snapshot_dirty_workspace(ws_root)
 
     cmd.extend(["-p", args.prompt])
 
@@ -301,13 +442,35 @@ def main() -> int:
     denied = parsed.get("denied_actions") or []
     err_msg = parsed.get("error") or ""
 
+    if args.subcommand == "review" and snapshot_dir:
+        try:
+            manifest = json.loads((Path(snapshot_dir) / "manifest.json").read_text(encoding="utf-8"))
+            post_head = get_head_commit(ws_root)
+            post_tree = get_index_tree(ws_root)
+            post_existing, post_deleted = list_dirty_state(ws_root)
+            post_hashes = {
+                rel: sha256_file(ws_root / rel)
+                for rel in post_existing
+                if (ws_root / rel).is_file() and not (ws_root / rel).is_symlink()
+            }
+            if (
+                post_head != manifest["head_commit"]
+                or post_tree != manifest["index_tree"]
+                or post_existing != manifest["saved_files"]
+                or post_deleted != manifest["pre_deleted_files"]
+                or post_hashes != manifest["file_hashes"]
+            ):
+                err_msg = (err_msg + "; " if err_msg else "") + "Workspace was modified during read-only review"
+        except Exception as e:
+            err_msg = (err_msg + "; " if err_msg else "") + f"Post-review verification failed: {e}"
+
     ok = proc.returncode == 0 and status == "SUCCESS" and not denied and not err_msg
     result = {
         "ok": ok,
         "exit_code": proc.returncode,
         "status": status,
         "conversation_id": conv_id,
-        "project_id": project_id,
+        "project_id": project_id or "default-cli-project",
         "workspace": str(ws_root),
         "pre_snapshot_dir": snapshot_dir,
         "denied_actions": denied,
