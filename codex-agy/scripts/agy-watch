@@ -5,7 +5,8 @@ agy-watch: 实时彩色监视最新 AGY CLI 运行状态
 特性：
 1. 100% 只读旁路，零侵入，不干扰 Codex 与 AGY 自动化流程；
 2. 跨会话自动无缝切换：当旧会话结束、新会话拉起时，自动切换至最新会话流，无需手动重启脚本；
-3. 纯标准库实现，零第三方依赖（无需安装 jq）。
+3. 纯标准库实现，零第三方依赖（无需安装 jq）；
+4. 支持详细模式 (-v / -vv)：不省略长文本，完整显示用户指令、工具全路径、命令及执行结果。
 """
 
 import os
@@ -14,6 +15,8 @@ import time
 import json
 import sys
 import signal
+import re
+import argparse
 
 signal.signal(signal.SIGINT, lambda s, f: sys.exit(0))
 
@@ -25,7 +28,7 @@ def get_latest_file():
         return None
     return max(files, key=os.path.getmtime)
 
-def fmt_entry(line):
+def fmt_entry(line, verbose=0):
     try:
         obj = json.loads(line)
     except Exception:
@@ -43,10 +46,21 @@ def fmt_entry(line):
     c_arg = lambda s: f"\033[37m{s}\033[0m"
     c_msg = lambda s: f"\033[96m{s}\033[0m"
     c_user = lambda s: f"\033[1;45;97m{s}\033[0m"
+    c_ok = lambda s: f"\033[32m{s}\033[0m"
+    c_err = lambda s: f"\033[31m{s}\033[0m"
 
     if tp == "USER_INPUT":
-        cnt = (obj.get("content") or "").replace("\n", " ")[:80]
-        return f"{c_dim('[' + ca + ']')} {c_user(' 🚀 USER ')} {c_msg(cnt)}"
+        raw_cnt = (obj.get("content") or "").strip()
+        clean_cnt = re.sub(r"</?USER_REQUEST>", "", raw_cnt).strip()
+        if verbose == 0:
+            cnt = clean_cnt.replace("\n", " ")[:100]
+            return f"{c_dim('[' + ca + ']')} {c_user(' 🚀 USER ')} {c_msg(cnt)}"
+        else:
+            lines = clean_cnt.splitlines()
+            header = f"{c_dim('[' + ca + ']')} {c_user(' 🚀 USER REQUEST (Full) ')}"
+            body = "\n".join([f"  {c_dim('│')} {c_msg(l)}" for l in lines])
+            return f"{header}\n{body}"
+
     elif tp == "PLANNER_RESPONSE":
         tcs = obj.get("tool_calls", [])
         if tcs:
@@ -56,25 +70,85 @@ def fmt_entry(line):
                 args = tc.get("args", {})
                 if name == "run_command":
                     styled = c_cmd(name)
-                    arg_str = str(args.get("CommandLine", "")).strip('"')[:60]
+                    cmd = str(args.get("CommandLine", "")).strip('"')
+                    arg_str = cmd if verbose > 0 else cmd[:60]
                 elif name in ("edit_file", "write_file"):
                     styled = c_edit(name)
-                    arg_str = str(args.get("Path", "")).strip('"').split("/")[-1]
+                    p = str(args.get("Path", "")).strip('"')
+                    arg_str = p if verbose > 0 else p.split("/")[-1]
                 elif name == "read_file":
                     styled = c_read(name)
-                    arg_str = str(args.get("Path", "")).strip('"').split("/")[-1]
+                    p = str(args.get("Path", "")).strip('"')
+                    sl = args.get("StartLine")
+                    el = args.get("EndLine")
+                    range_str = f" #L{sl}-L{el}" if sl or el else ""
+                    arg_str = (p + range_str) if verbose > 0 else (p.split("/")[-1] + range_str)
                 else:
                     styled = c_tool(name)
-                    arg_str = str(args.get("Query") or args.get("SearchPath") or "").strip('"')
+                    q = str(args.get("Query") or args.get("SearchPath") or "").strip('"')
+                    arg_str = q
                 calls.append(f"{styled}({c_arg(arg_str)})")
             return f"{c_dim('[' + ca + ']')} {c_step('#' + str(si))} {', '.join(calls)}"
         else:
-            cnt = (obj.get("content") or "").replace("\n", " ")[:80]
+            cnt = (obj.get("content") or "").strip()
             if cnt:
-                return f"{c_dim('[' + ca + ']')} {c_step('#' + str(si))} \033[35m💬\033[0m {c_msg(cnt)}"
+                if verbose == 0:
+                    short = cnt.replace("\n", " ")[:100]
+                    return f"{c_dim('[' + ca + ']')} {c_step('#' + str(si))} \033[35m💬\033[0m {c_msg(short)}"
+                else:
+                    lines = cnt.splitlines()
+                    header = f"{c_dim('[' + ca + ']')} {c_step('#' + str(si))} \033[35m💬 MODEL RESPONSE (Full):\033[0m"
+                    body = "\n".join([f"  {c_dim('│')} {l}" for l in lines])
+                    return f"{header}\n{body}"
+
+    elif tp == "GENERIC" and verbose > 0:
+        raw = obj.get("content", "").strip()
+        if not raw:
+            return None
+        lines = [l for l in raw.splitlines() if not l.startswith("Created At:") and not l.startswith("Completed At:")]
+        clean_text = "\n".join(lines).strip()
+        if not clean_text:
+            return None
+
+        if "Command exited with code 0." in clean_text:
+            out_part = clean_text.split("Command output:\n")[-1].strip()
+            if verbose == 1:
+                out_first = [l.strip() for l in out_part.splitlines() if l.strip()][:3]
+                summary = " ".join(out_first)[:120] if out_part else "OK"
+                return f"{c_dim('[' + ca + ']')}   {c_ok('└─ ✔️ [exit 0]')} {c_dim(summary)}"
+            else:
+                body = "\n".join([f"      {c_dim('│')} {l}" for l in out_part.splitlines()])
+                return f"{c_dim('[' + ca + ']')}   {c_ok('└─ ✔️ [exit 0] Command output:')}\n{body}"
+        elif "Command exited with code" in clean_text:
+            return f"{c_dim('[' + ca + ']')}   {c_err('└─ ❌ ' + clean_text[:160])}"
+        elif "Made" in clean_text and "replacement" in clean_text:
+            return f"{c_dim('[' + ca + ']')}   \033[35m└─ 📝 " + clean_text.splitlines()[0] + "\033[0m"
+        elif "Showing lines" in clean_text:
+            m = re.search(r"Showing lines (\d+-\d+ of \d+)", clean_text)
+            info = m.group(0) if m else "read content"
+            return f"{c_dim('[' + ca + ']')}   {c_dim('└─ 📖 ' + info)}"
+        else:
+            return f"{c_dim('[' + ca + ']')}   {c_dim('└─ ' + clean_text[:100])}"
+
     return None
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="实时彩色监视最新 AGY CLI 运行状态（支持跨会话热切换）",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""示例:
+  agy-watch         # 默认紧凑看板模式（防刷屏）
+  agy-watch -v      # 详细模式（不截断长指令，显示完整文件路径与执行结果摘要）
+  agy-watch -vv     # 完整详细模式（包含命令全量输出）
+  agy-watch -v -n 30 # 详细模式，并回显最近 30 行
+"""
+    )
+    parser.add_argument("-v", "--verbose", action="count", default=0,
+                        help="详细模式 (-v 显示完整指令/路径/结果摘要；-vv 显示命令全量输出)")
+    parser.add_argument("-n", "--lines", type=int, default=15,
+                        help="启动或切换新会话时回显的历史行数（默认 15）")
+    args = parser.parse_args()
+
     current_file = None
     fp = None
     last_check_time = 0
@@ -82,6 +156,8 @@ def main():
     if not os.path.exists(BRAIN_DIR):
         print(f"\033[31m未找到 AGY 日志目录: {BRAIN_DIR}\033[0m", file=sys.stderr)
         sys.exit(1)
+
+    mode_label = "【详细模式 -v】" if args.verbose == 1 else ("【全量详细模式 -vv】" if args.verbose > 1 else "【紧凑看板模式】")
 
     while True:
         now = time.time()
@@ -97,14 +173,14 @@ def main():
                         pass
                 current_file = latest
                 session_id = os.path.basename(os.path.dirname(os.path.dirname(os.path.dirname(current_file))))
-                print(f"\n\033[1;34m>>> 正在实时监听 AGY 会话:\033[0m \033[1;36m{session_id}\033[0m \033[90m({current_file})\033[0m\n", flush=True)
+                print(f"\n\033[1;34m>>> 正在实时监听 AGY 会话:\033[0m \033[1;36m{session_id}\033[0m \033[33m{mode_label}\033[0m\n\033[90m    文件: {current_file}\033[0m\n", flush=True)
 
-                # 切换新会话时先打印最近 15 步历史
+                # 切换新会话时回显指定行数的历史
                 try:
                     with open(current_file, "r", encoding="utf-8", errors="replace") as f_prev:
-                        recent_lines = f_prev.readlines()[-15:]
+                        recent_lines = f_prev.readlines()[-args.lines:]
                         for l in recent_lines:
-                            formatted = fmt_entry(l)
+                            formatted = fmt_entry(l, verbose=args.verbose)
                             if formatted:
                                 print(formatted, flush=True)
                 except Exception:
@@ -116,7 +192,7 @@ def main():
         if fp:
             line = fp.readline()
             if line:
-                formatted = fmt_entry(line)
+                formatted = fmt_entry(line, verbose=args.verbose)
                 if formatted:
                     print(formatted, flush=True)
             else:
