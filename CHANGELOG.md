@@ -1,5 +1,19 @@
 # Changelog
 
+## [2.5.0] - 2026-11-12 — 双通道（`agy` 个人 / `agy-gcp` GCP ADC）支持、分通道旗舰对齐与 Carbon 超时根因修复
+
+1. **固化 `agy`（个人 Google Pro，默认）与 `agy-gcp`（GCP Vertex AI ADC，按需）双通道切换与环境隔离**：
+   - **默认个人通道防串号**：默认使用个人通道 `agy`，调用时强制通过 `env -u AGY_ADC_AUTH -u GOOGLE_APPLICATION_CREDENTIALS -u CLOUDSDK_CORE_PROJECT -u GOOGLE_CLOUD_PROJECT` 剥离父终端残留的 GCP 变量，且每次显式传 `--model` 覆盖共享 `settings.json` 缓存。
+   - **非交互 Shell 安全调用 `agy-gcp`**：Codex `tools.exec_command` 默认以 `/bin/zsh -lc`（非交互 Shell）运行，无法直接读取 `~/.zshrc` 中的 `agy-gcp` 函数。`SKILL.md` 固化自适配启动器：优先直调可执行 `agy-gcp`（同步新增免硬编码项目的 [`bin/agy-gcp`](bin/agy-gcp) 包装脚本），未安装脚本时自动回退 `SHELL_SESSIONS_DISABLE=1 /bin/zsh -ic 'agy-gcp "$@"' zsh <参数...>`（位置参数透传杜绝多行提示词与 JSON 二次引号转义损坏，并屏蔽 macOS 交互 Zsh 退出时的 `Saving session...` 输出污染）。
+2. **解除单一模型硬编码，建立分通道主力/旗舰模型矩阵**：
+   - 实测核对两端 `models` 列表：个人通道 `agy` 仅含 `gemini-4-argon-*`（无 `carbon`），而 GCP 通道 `agy-gcp` 最新一代旗舰为 `gemini-4-carbon-*`（`argon` 已退居次旗舰）。
+   - 日常实施、修复、单测、文档默认仍用主力 `gemini-3.8-flash-high`；当用户明确要求使用最新旗舰时，按通道精确对齐（`agy` $\rightarrow$ `gemini-4-argon-medium`，`agy-gcp` $\rightarrow$ `gemini-4-carbon-medium`），不确定模型 ID 时先执行对应通道 `models` 核实，保留“新会话启动旗舰（禁继承 Flash 长上下文）”与“超配额/不可用自动降级”锁。
+3. **查明并修复 `agy-gcp` 下 `gemini-4-carbon-low` 90 秒超时空回复问题（禁设短 `--print-timeout`）**：
+   - **取证结论**：交叉审计 Codex rollout 与 `cli-20261112_*.log` 证实，`agy -p` 冷启动需经历 ADC 换票（`3~4.5s`）+ 插件 MCP/SessionStart Hook 初始化（`4.6s~18.4s`），而 Vertex AI Global 端点的 `gemini-4-carbon` 首包排队及经本地代理偶发 `unexpected EOF` / `TLS handshake timeout` 自动重试总耗时常达 `75s~160s`。Codex 测试时擅自附加 `--print-timeout 40s / 90s` 导致在流式首包落盘前被 `poll.go:182` 腰斩返回空回复；放宽超时后同命令 `24.1s`（含冷启动全程 `<120s`）正常返回 `SUCCESS`。
+   - **规范固化**：严禁在 CLI 命令中附加短 `--print-timeout`（保持默认 `0s`），统一由外层 Codex V8 `while` + `functions.wait` 承接等待。
+
+---
+
 ## [2.4.1] - 2026-11-10 — 旗舰模型配额防爆锁与 Flash（High）全面死锁
 
 1. **实施与修复全面锁死 Flash（High）**：

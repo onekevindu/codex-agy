@@ -1,17 +1,29 @@
 # Codex AGY
 
-用额度充裕的 AGY（Gemini）分担代码调研、实现与自测闭环，节省主控 Codex 的额度。
+用额度充裕的 AGY（Gemini）分担代码调研、实现与自测闭环，节省主控 Codex 的额度。支持 **个人账户 `agy`（默认）** 与 **GCP Vertex AI ADC `agy-gcp`（按需切换）** 双通道隔离调用。
 
-将 [AGENTS.md](AGENTS.md) 中的分工合并到目标项目的 `AGENTS.md`。确认 `agy` 已安装并登录，然后在本仓库根目录安装 Skill（零外部脚本依赖，换机或分享他人直接复制 `SKILL.md` 即可使用）：
+将 [AGENTS.md](AGENTS.md) 中的分工合并到目标项目的 `AGENTS.md`。确认 `agy` 已安装并登录，然后在本仓库根目录安装 Skill（零外部脚本强依赖，换机或分享他人直接复制 `SKILL.md` 即可使用）：
 
 ```bash
 mkdir -p ~/.codex/skills/codex-agy
 cp codex-agy/SKILL.md ~/.codex/skills/codex-agy/SKILL.md
+
+# （可选推荐）若本机配置了 GCP ADC 凭证，将独立包装脚本放入 PATH，免去 Codex 非交互 Shell 回退 zsh -ic 的启动开销：
+mkdir -p ~/.local/bin
+cp bin/agy-gcp ~/.local/bin/agy-gcp
 ```
 
 在目标项目的 Codex 对话中按需调用 `$codex-agy`。
-- [SKILL.md](codex-agy/SKILL.md)：纯原生 `agy` 调用规范与 Codex V8 零唤醒等待模板。
+- [SKILL.md](codex-agy/SKILL.md)：双通道（`agy` / `agy-gcp`）自适应调用规范、分通道模型选型矩阵与 Codex V8 零唤醒等待模板。
+- [bin/agy-gcp](bin/agy-gcp)：GCP Vertex AI ADC 独立可执行包装器（自动解析 `~/.gemini/credentials/gcp-adc.json` 或标准 gcloud ADC 凭证与项目 ID）。
 - [CHANGELOG.md](CHANGELOG.md)：问题排查复盘与版本演进记录。
+
+## 双通道与模型矩阵速览
+
+| 通道 | 触发条件 | 日常主力（默认锁死） | 最新旗舰（仅用户明确授权 + 新会话） | 非交互 Shell 调用保障 |
+| :--- | :--- | :--- | :--- | :--- |
+| **`agy`**（个人 Google Pro） | **默认使用** | `gemini-3.8-flash-high` | `gemini-4-argon-medium`（个人通道无 Carbon） | 自动 `env -u` 剥离 GCP ADC 变量防串号 |
+| **`agy-gcp`**（GCP Vertex AI ADC） | 用户点名 `agy-gcp` / `GCP` / `Carbon` 或项目 `AGENTS.md` 指定 | `gemini-3.8-flash-high` | `gemini-4-carbon-medium`（GCP 专属最新旗舰） | 优先直调可执行 `agy-gcp`，否则回退 `SHELL_SESSIONS_DISABLE=1 /bin/zsh -ic 'agy-gcp "$@"' zsh` 位置参数透传 |
 
 ## 架构与执行流程
 
@@ -22,8 +34,8 @@ cp codex-agy/SKILL.md ~/.codex/skills/codex-agy/SKILL.md
 ### 协作四原则
 
 1. **委托前**：Codex 讲清楚**业务目标、必要设计、不可变边界和验收条件**，不对 AGY 做过度限制或手把手指导。复杂方案可按需请 AGY 做单轮只读评估。
-2. **执行中**：单层直派原生 `agy` 会话，由 AGY 自主完成阅读、编码、运行测试与局部纠错；Codex 在 `functions.exec` V8 沙箱内用 `while` 循环与 `functions.wait` 持续等待，不高频轮询、不按读取次数和耗时催写。
-3. **交付后**：Codex 核对返回 JSON（`conversation_id`、`status`、`denied_actions`），集中审查 `git diff` 并执行独立验证，把实际问题一次性交回 AGY。
+2. **执行中**：单层直派单个 `agy` / `agy-gcp` 会话（**禁设短 `--print-timeout`**），由 AGY 自主完成阅读、编码、运行测试与局部纠错；Codex 在 `functions.exec` V8 沙箱内用 `while` 循环与 `functions.wait` 持续等待，不高频轮询、不按读取次数和耗时催写。
+3. **交付后**：Codex 核对返回 JSON（`conversation_id`、`status`、`denied_actions`），集中审查 `git diff` 并执行独立验证，把实际问题一次性交回同一通道的 AGY。
 4. **出现阻塞时**：针对具体阻塞定向处理，Codex 绝不亲自下场改业务代码。
 
 ---

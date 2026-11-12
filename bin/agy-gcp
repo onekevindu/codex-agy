@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# agy-gcp: 以 Google Cloud ADC (Vertex AI) 凭证启动原生 agy CLI
+# 凭证解析优先级：AGY_GCP_CREDENTIALS > GOOGLE_APPLICATION_CREDENTIALS > ~/.gemini/credentials/gcp-adc.json > ~/.config/gcloud/application_default_credentials.json
+# 项目解析优先级：AGY_GCP_PROJECT > GOOGLE_CLOUD_PROJECT > CLOUDSDK_CORE_PROJECT > ADC JSON 内置项目 > gcloud 当前激活配置
+
+ADC_FILE="${AGY_GCP_CREDENTIALS:-${GOOGLE_APPLICATION_CREDENTIALS:-$HOME/.gemini/credentials/gcp-adc.json}}"
+if [ ! -f "$ADC_FILE" ]; then
+  FALLBACK_ADC="$HOME/.config/gcloud/application_default_credentials.json"
+  if [ -f "$FALLBACK_ADC" ]; then
+    ADC_FILE="$FALLBACK_ADC"
+  else
+    echo "[agy-gcp] error: ADC credentials file not found at $ADC_FILE (or $FALLBACK_ADC)." >&2
+    exit 1
+  fi
+fi
+
+GCP_PROJECT="${AGY_GCP_PROJECT:-${GOOGLE_CLOUD_PROJECT:-${CLOUDSDK_CORE_PROJECT:-}}}"
+if [ -z "$GCP_PROJECT" ]; then
+  GCP_PROJECT="$(ADC_PATH="$ADC_FILE" python3 - <<'PY'
+import configparser, json, os
+
+adc_path = os.environ["ADC_PATH"]
+proj = ""
+try:
+    with open(adc_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    proj = data.get("quota_project_id") or data.get("project_id") or ""
+except Exception:
+    pass
+
+if not proj:
+    cfg_dir = os.path.expanduser("~/.config/gcloud")
+    active = "default"
+    active_file = os.path.join(cfg_dir, "active_config")
+    if os.path.isfile(active_file):
+        try:
+            with open(active_file, "r", encoding="utf-8") as f:
+                active = f.read().strip() or "default"
+        except Exception:
+            pass
+    cfg_file = os.path.join(cfg_dir, "configurations", f"config_{active}")
+    if os.path.isfile(cfg_file):
+        cp = configparser.ConfigParser()
+        try:
+            cp.read(cfg_file, encoding="utf-8")
+            proj = cp.get("core", "project", fallback="").strip()
+        except Exception:
+            pass
+
+print(proj)
+PY
+)"
+fi
+
+if [ -z "$GCP_PROJECT" ] && command -v gcloud >/dev/null 2>&1; then
+  GCP_PROJECT="$(gcloud config get-value project 2>/dev/null || true)"
+fi
+
+if [ -z "$GCP_PROJECT" ]; then
+  echo "[agy-gcp] error: unable to resolve GCP project ID. Set AGY_GCP_PROJECT or GOOGLE_CLOUD_PROJECT." >&2
+  exit 1
+fi
+
+AGY_BIN="${AGY_BIN:-}"
+if [ -z "$AGY_BIN" ]; then
+  if command -v agy >/dev/null 2>&1; then
+    AGY_BIN="$(command -v agy)"
+  elif [ -x "$HOME/.local/bin/agy" ]; then
+    AGY_BIN="$HOME/.local/bin/agy"
+  else
+    echo "[agy-gcp] error: 'agy' binary not found in PATH or ~/.local/bin/agy." >&2
+    exit 1
+  fi
+fi
+
+exec env \
+  CLOUDSDK_CORE_PROJECT="$GCP_PROJECT" \
+  GOOGLE_CLOUD_PROJECT="$GCP_PROJECT" \
+  AGY_ADC_AUTH="true" \
+  GOOGLE_APPLICATION_CREDENTIALS="$ADC_FILE" \
+  "$AGY_BIN" "$@"
